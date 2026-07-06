@@ -6,8 +6,7 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-
+from sqlalchemy import select, or_
 from Algorithm.TextCleaner import TextCleaner
 from Helpers.MusicBrainzHelper import MusicBrainzHelper
 from Helpers.MetaMapper import MetaMapper
@@ -410,7 +409,9 @@ class MetadataPipeline:
         if not title_norm:
             return {}
 
-        track = await self._db_track_by_title_artist(title_norm, artist_norm)
+        track = await self._db_track_by_title_artist(
+            title_norm, artist_norm, song.meta.album, song.meta.duration_ms,
+            )
         if track and not self._db_track_matches_version(track, title_has_remix):
             self.log.debug(
                 f"[Pipeline][DB] Match per titolo/artista {track.track_name!r} "
@@ -1143,3 +1144,57 @@ class MetadataPipeline:
                     await provider.close()
                 except Exception:
                     pass
+
+    # Pipeline/MetadataPipeline.py — import in cima al file
+    @staticmethod
+    def _key_word(norm: str) -> str:
+        words = [w for w in norm.split() if w not in TextCleaner._STOPWORDS]
+        return max(words, key=len) if words else (norm.split()[0] if norm else "")
+
+    async def _db_candidate_rows(self, title_norm: str, artist_norm: str) -> list[AppleMusicTrack]:
+        """Pre-filtro SQL (word LIKE) invece di limit(200) arbitrario, che scartava
+        ogni riga oltre le prime 200 senza alcun criterio."""
+        conds = []
+        if artist_norm:
+            conds.append(AppleMusicTrack.artist_name.ilike(f"%{self._key_word(artist_norm)}%"))
+        if title_norm:
+            conds.append(AppleMusicTrack.track_name.ilike(f"%{self._key_word(title_norm)}%"))
+        if not conds:
+            return []
+        stmt = select(AppleMusicTrack).where(or_(*conds)).limit(3000)
+        result = await self.db_session.execute(stmt)
+        return list(result.scalars().all())
+
+
+    async def _db_track_by_title_artist(
+        self, title_norm: str, artist_norm: str, album_hint: str = "",
+        duration_ms: Optional[int] = None,
+    ) -> Optional[AppleMusicTrack]:
+        try:
+            rows = await self._db_candidate_rows(title_norm, artist_norm)
+        except Exception as exc:
+            self.log.debug(f"[Pipeline][DB] select tracks fallito: {exc}")
+            return None
+        if not rows:
+            return None
+
+        album_norm = TextCleaner.normalize(album_hint) if album_hint else ""
+        best_track, best_score = None, -1.0
+
+        for row in rows:
+            candidate = {
+                "trackName": row.track_name or "",
+                "artistName": row.artist_name or "",
+                "collectionName": row.collection_name or "",
+                "trackTimeMillis": row.track_time_millis,
+            }
+            score = self.matcher.score_candidate(
+                title=title_norm, artist=artist_norm, album_hint=album_norm,
+                duration_ms=duration_ms, isrc="", candidate=candidate,
+            )
+            if score is not None and score > best_score:
+                best_score, best_track = score, row
+
+        if best_track:
+            self.log.debug(f"[Pipeline][DB] Hit: '{best_track.track_name}' score={best_score:.2f}")
+        return best_track
