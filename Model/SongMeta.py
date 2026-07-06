@@ -1,3 +1,4 @@
+# Model/SongMeta.py
 from __future__ import annotations
 
 import json
@@ -17,6 +18,8 @@ class SongMeta:
     label:          str           = ""
     country:        str           = ""
     artist_collection:  str       = ""
+    composer:       str           = ""
+    copyright:      str           = ""
 
     track_number:   int           = 0
     disc_number:    int           = 0
@@ -26,6 +29,7 @@ class SongMeta:
     explicit:       bool          = False
     compilation:    bool          = False
     media_type:     int           = 1
+    matched:        bool          = False
 
     duration_ms:    Optional[int] = None
 

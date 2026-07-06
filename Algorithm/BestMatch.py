@@ -4,7 +4,7 @@ import re
 from functools import total_ordering, lru_cache
 from typing import Optional
 from unidecode import unidecode
-from jellyfish import levenshtein_distance
+from rapidfuzz.distance import Indel, JaroWinkler
 
 from Algorithm.RegexToken import EditionTokens
 
@@ -176,7 +176,9 @@ def _string_dist_basic(s1: str, s2: str) -> float:
         return 1.0
     if a == b:
         return 0.0
-    return levenshtein_distance(a, b) / float(max(len(a), len(b)))
+    if min(len(a), len(b)) <= 6:
+        return 1.0 - JaroWinkler.normalized_similarity(a, b)
+    return Indel.normalized_distance(a, b)
 
 
 @lru_cache(maxsize=4096)
@@ -248,40 +250,13 @@ def _primary_artist_contained(primary: str, candidate_artist: str) -> bool:
 
 
 def strip_parenthetical(s: str) -> str:
-    """
-    Rimuove contenuto tra parentesi/brackets (non solo i caratteri, anche il
-    testo interno). Utility condivisa: usata sia qui per `_title_is_truncation`
-    sia da ItunesProvider per i confronti sul titolo "core" che devono
-    ignorare tag di versione (remix/live/acoustic/ecc.) tra parentesi.
-    """
     return re.sub(r'[\(\[][^\)\]]*[\)\]]', '', s).strip()
 
 
-# alias privato per uso interno al modulo (retrocompatibilità interna)
 _strip_parenthetical = strip_parenthetical
 
 
 def _title_is_truncation(title_norm: str, cand_title: str) -> float:
-    """
-    Penalizza un candidato il cui titolo è un troncamento "casuale" del
-    titolo cercato (es. "Pop Out" trovato cercando "Pop Out Again": titoli
-    realmente diversi, non lo stesso brano).
-
-    FIX (refactoring): confrontava le stringhe via _alnum(), che rimuove i
-    caratteri "(" ")" ma non il CONTENUTO tra parentesi — quindi
-    "Leaked (Remix)" diventava "leakedremix" e veniva confrontato come se
-    "remix" fosse un'estensione semantica del titolo "leaked", facendo
-    scattare il troncamento (penalty ~0.45 > soglia 0.25) e quindi un hard
-    reject di QUALSIASI candidato con titolo "pulito" (es. solo "Leaked")
-    per una ricerca con tag tra parentesi nel titolo originale (remix, live,
-    acoustic, ecc.) — sintomo riportato: "MB miss" sistematico su ogni
-    titolo con "(Remix)" quando MB cataloga la recording senza il tag nel
-    campo title (caso comune). Fix: il confronto di troncamento ora usa il
-    titolo "core" (parti tra parentesi rimosse PRIMA di _alnum), così un tag
-    tra parentesi non genera mai falsa truncation_penalty. Il vero controllo
-    sulla coerenza del tag versione resta a carico di remix_mismatch/live_mismatch
-    più sotto in _compute_distance, che è la sede corretta per questa logica.
-    """
     a = _alnum(_strip_parenthetical(title_norm))
     b = _alnum(_strip_parenthetical(cand_title))
     if not a or not b or len(b) >= len(a):

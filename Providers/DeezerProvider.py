@@ -1,3 +1,4 @@
+# Providers/DeezerProvider.py
 import asyncio
 import logging
 import re
@@ -83,7 +84,7 @@ class DeezerProvider:
         client: Optional[httpx.AsyncClient] = None,
         timeout: float = 10.0,
         logger: Optional[logging.Logger] = None,
-        local_cache=None,  # NUOVO: cache album_id condivisa (es. LocalAlbumCache)
+        local_cache=None,
     ) -> None:
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
@@ -92,15 +93,12 @@ class DeezerProvider:
         self.log = logger or logging.getLogger(__name__)
 
         self.local_cache = local_cache
-        # Cache in-memory per album_id → dati genere/anno (per-processo, vita breve)
         self._album_data_cache: dict[int, dict] = {}
         self._album_data_cache_lock = asyncio.Lock()
 
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
-
-    # ── HTTP ──────────────────────────────────────────────────────────────────
 
     async def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request
@@ -147,25 +145,16 @@ class DeezerProvider:
             return []
 
     async def _get_album_data(self, album_id: int) -> dict:
-        """
-        Fetch /album/{id} con cache a due livelli:
-        1. In-memory (self._album_data_cache) — vita del processo, evita
-           duplicati nello stesso run quando più tracce condividono l'album.
-        2. local_cache (opzionale, persistente su disco) — solo genere/anno,
-           per evitare round-trip HTTP anche tra run diversi.
-        """
         if not album_id:
             return {}
 
         async with self._album_data_cache_lock:
             if album_id in self._album_data_cache:
-                self.log.debug(f"[Deezer] [Cache-mem] hit album {album_id}")
                 return self._album_data_cache[album_id]
 
         if self.local_cache:
             cached_meta = self.local_cache.get_deezer_album_meta(album_id)
             if cached_meta is not None:
-                self.log.debug(f"[Deezer] [Cache-disk] hit album {album_id}")
                 async with self._album_data_cache_lock:
                     self._album_data_cache[album_id] = cached_meta
                 return cached_meta
@@ -183,7 +172,6 @@ class DeezerProvider:
                 return {}
 
         if r.status_code != 200:
-            self.log.debug(f"[Deezer] HTTP {r.status_code} per album {album_id}")
             return {}
 
         try:
@@ -197,7 +185,6 @@ class DeezerProvider:
 
         if self.local_cache:
             self.local_cache.set_deezer_album_meta(album_id, album_data)
-            self.log.debug(f"[Deezer] [Cache-disk] scritto album {album_id}")
 
         return album_data
 
@@ -215,15 +202,12 @@ class DeezerProvider:
                 return {}
 
         if r.status_code != 200:
-            self.log.debug(f"[Deezer] HTTP {r.status_code} per track {track_id}")
             return {}
         try:
             return r.json()
         except Exception as exc:
             self.log.debug(f"[Deezer] JSON non valido track {track_id}: {exc}")
             return {}
-
-    # ── Query builders ────────────────────────────────────────────────────────
 
     def _search(self, **fields: str) -> str:
         parts = []
@@ -234,10 +218,20 @@ class DeezerProvider:
                     parts.append(f'{field}:"{clean}"')
         return " ".join(parts)
 
-    # ── ISRC lookup (NUOVO) ──────────────────────────────────────────────────
+    def _search_free(self, **fields: str) -> str:
+        """Query senza quoting: fallback quando la quoted-query non trova nulla."""
+        return " ".join(_clean_query_term(v) for v in fields.values() if v)
+
+    async def _search_with_fallback(self, limit: int, **fields: str) -> list:
+        query = self._search(**fields)
+        data = await self._get(self.SEARCH_URL, {"q": query, "limit": limit}) if query else []
+        if not data:
+            free_query = self._search_free(**fields)
+            if free_query and free_query != query:
+                data = await self._get(self.SEARCH_URL, {"q": free_query, "limit": limit})
+        return data
 
     async def get_by_isrc(self, isrc: str) -> dict:
-        """Lookup diretto: GET /2.0/track/isrc:{isrc}. Genere via /album/{id} (cached)."""
         if not isrc:
             return {}
 
@@ -283,7 +277,7 @@ class DeezerProvider:
         }
 
         if album_id:
-            album_data = await self._get_album_data(album_id)  # cached
+            album_data = await self._get_album_data(album_id)
             if album_data:
                 genres = album_data.get("genres", {}).get("data", [])
                 if genres:
@@ -296,25 +290,22 @@ class DeezerProvider:
         self.log.debug(f"[Deezer] ISRC {isrc} -> '{result['title']}' genre={result.get('genre')!r}")
         return result
 
-    # ── Public API esistente (invariata) ─────────────────────────────────────
-
     async def get_cover_url(self, title: str, artist: str = "", album: str = "") -> Optional[str]:
         if not title and not artist:
             return None
-        strategies = []
-        if artist and album and title:
-            strategies.append(self._search(artist=artist, album=album, track=title))
-        if artist and title:
-            strategies.append(self._search(artist=artist, track=title))
-        if artist and album:
-            strategies.append(self._search(artist=artist, album=album))
-        if artist:
-            strategies.append(self._search(artist=artist))
 
-        for query in strategies:
-            if not query:
-                continue
-            tracks = await self._get(self.SEARCH_URL, {"q": query, "limit": 10})
+        attempts = []
+        if artist and album and title:
+            attempts.append({"artist": artist, "album": album, "track": title})
+        if artist and title:
+            attempts.append({"artist": artist, "track": title})
+        if artist and album:
+            attempts.append({"artist": artist, "album": album})
+        if artist:
+            attempts.append({"artist": artist})
+
+        for fields in attempts:
+            tracks = await self._search_with_fallback(10, **fields)
             best = _pick_best_track(tracks, album)
             if best:
                 cover = _best_cover(best.get("album", {}))
@@ -325,11 +316,8 @@ class DeezerProvider:
     async def get_genre(self, title: str, artist: str) -> str:
         if not title or not artist:
             return ""
-        query = self._search(track=title, artist=artist)
-        if not query:
-            return ""
         try:
-            data = await self._get(self.SEARCH_URL, {"q": query, "limit": 5})
+            data = await self._search_with_fallback(5, track=title, artist=artist)
             if not data:
                 return ""
             best = _pick_best_track(data, "")
@@ -338,7 +326,7 @@ class DeezerProvider:
             album_id = best.get("album", {}).get("id")
             if not album_id:
                 return ""
-            album_data = await self._get_album_data(album_id)  # cached
+            album_data = await self._get_album_data(album_id)
             genres = album_data.get("genres", {}).get("data", [])
             if genres:
                 return genres[0].get("name", "")
@@ -349,11 +337,8 @@ class DeezerProvider:
     async def get_track_and_disc(self, title: str, artist: str, album: str = "") -> tuple[int, int]:
         if not title or not artist:
             return 0, 0
-        query = self._search(track=title, artist=artist, album=album)
-        if not query:
-            return 0, 0
         try:
-            data = await self._get(self.SEARCH_URL, {"q": query, "limit": 5})
+            data = await self._search_with_fallback(5, track=title, artist=artist, album=album)
             if not data:
                 return 0, 0
             best = _pick_best_track(data, album)
@@ -371,11 +356,8 @@ class DeezerProvider:
     async def get_full_metadata(self, title: str, artist: str, album: str = "") -> dict:
         if not title and not artist:
             return {}
-        query = self._search(track=title, artist=artist, album=album)
-        if not query:
-            return {}
         try:
-            data = await self._get(self.SEARCH_URL, {"q": query, "limit": 5})
+            data = await self._search_with_fallback(5, track=title, artist=artist, album=album)
             if not data:
                 return {}
             best = _pick_best_track(data, album)
@@ -401,7 +383,7 @@ class DeezerProvider:
                     result["isrc"] = track_data.get("isrc", "")
 
             if album_id:
-                album_data = await self._get_album_data(album_id)  # cached
+                album_data = await self._get_album_data(album_id)
                 if album_data:
                     genres = album_data.get("genres", {}).get("data", [])
                     if genres:
@@ -414,15 +396,11 @@ class DeezerProvider:
         except Exception as exc:
             self.log.warning(f"[Deezer] get_full_metadata fallito: {exc}")
         return {}
-    
+
     async def search_by_title_artist(self, title: str, artist: str) -> dict:
-        """Cerca titolo+artista su Deezer, restituisce metadati + ISRC."""
         if not title or not artist:
             return {}
-        query = self._search(track=title, artist=artist)
-        if not query:
-            return {}
-        data = await self._get(self.SEARCH_URL, {"q": query, "limit": 10})
+        data = await self._search_with_fallback(10, track=title, artist=artist)
         best = _pick_best_track(data, "")
         if not best:
             return {}
@@ -431,7 +409,6 @@ class DeezerProvider:
         if not track_id:
             return {}
 
-        # Fetch dettaglio traccia per ISRC
         track_data = await self._get_track_data(track_id)
         if not track_data or not track_data.get("isrc"):
             return {}

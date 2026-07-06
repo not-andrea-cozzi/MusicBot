@@ -1,3 +1,4 @@
+# Model/SongMetaWriter.py
 from __future__ import annotations
 
 import logging
@@ -10,14 +11,8 @@ from Model.SongMeta import SongMeta
 
 
 class SongMetaWriter:
-    """
-    Scrittura statica dei tag MP4/M4A, ottimizzata per compatibilità Apple Music / iTunes.
-    Non richiede istanza Song: lavora direttamente su SongMeta + path file.
-    """
 
     log = logging.getLogger(__name__)
-
-    # ── Entry point ──────────────────────────────────────────────────────────
 
     @classmethod
     def write(
@@ -28,13 +23,10 @@ class SongMetaWriter:
         cover_url: Optional[str] = None,
         timeout: float = 10.0,
     ) -> None:
-        """Scrive tutti i tag + cover sul file MP4/M4A indicato."""
         tags = cls.build_tags(meta)
         cover = cover_bytes or cls._fetch_cover(cover_url or meta.cover_url, timeout=timeout)
         cls._write_to_file(path, tags, cover)
         cls.log.debug(f"[SongMetaWriter] Tag scritti su '{path}' ({len(tags)} atomi).")
-
-    # ── Tag building ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _freeform(val: str) -> list[MP4FreeForm]:
@@ -44,13 +36,13 @@ class SongMetaWriter:
     def build_tags(cls, m: SongMeta) -> dict:
         tags: dict = {}
 
-        # ── Testo base ───────────────────────────────────────────────────
         text_atoms = (
             ("\xa9nam", "title"),
             ("\xa9ART", "artist_collection"),
             ("aART",    "album_artist"),
             ("\xa9alb", "album"),
             ("\xa9gen", "genre"),
+            ("\xa9wrt", "composer"),
         )
         for atom, attr in text_atoms:
             v = getattr(m, attr, "") or ""
@@ -59,11 +51,9 @@ class SongMetaWriter:
             if v:
                 tags[atom] = [v]
 
-        # ── Anno ─────────────────────────────────────────────────────────
         if m.year and m.year.isdigit() and 1900 <= int(m.year) <= 2100:
             tags["\xa9day"] = [m.year]
 
-        # ── Sort fields (ordinamento corretto in Apple Music) ──────────
         sort_atoms = (
             ("sonm", "sort_title"),
             ("soar", "sort_artist"),
@@ -75,37 +65,37 @@ class SongMetaWriter:
             if v:
                 tags[atom] = [v]
 
-        # ── Track / disc ─────────────────────────────────────────────────
+        # ── Track / disc (fix: niente "(n, 0)" quando total ignoto) ─────
         if m.track_number > 0:
-            tags["trkn"] = [(m.track_number, m.total_tracks)]
+            tags["trkn"] = [(m.track_number, m.total_tracks)] if m.total_tracks > 0 else [(m.track_number, 0)]
         if m.disc_number > 0:
-            tags["disk"] = [(m.disc_number, m.total_discs)]
+            tags["disk"] = [(m.disc_number, m.total_discs)] if m.total_discs > 0 else [(m.disc_number, 0)]
 
-        # ── Flags ────────────────────────────────────────────────────────
         if m.compilation:
             tags["cpil"] = [1]
         tags["rtng"] = [4 if m.explicit else 0]
         tags["stik"] = [m.media_type]
-        tags["pgap"] = [0]   # gapless playback off di default, sicuro per singoli
+        tags["pgap"] = [0]
 
-        # ── Label / copyright ────────────────────────────────────────────
+        # ── Label / copyright (fix: cprt separato da label) ─────────────
         if m.label:
-            tags["cprt"]    = [m.label]
             tags["\xa9lab"] = [m.label]
             tags["----:com.apple.iTunes:LABEL"] = cls._freeform(m.label)
 
-        # ── Identificatori commerciali ───────────────────────────────────
+        if m.copyright:
+            tags["cprt"] = [m.copyright]
+        elif m.label and m.year:
+            tags["cprt"] = [f"℗ {m.year} {m.label}"]
+
         if m.upc:
             tags["----:com.apple.iTunes:BARCODE"] = cls._freeform(m.upc)
         if m.country:
             tags["----:com.apple.iTunes:MusicBrainz Album Release Country"] = cls._freeform(m.country)
 
-        # ── ISRC (sia tag nativo che freeform, massima compatibilità) ────
         if m.isrc:
             tags["\xa9isr"] = [m.isrc]
             tags["----:com.apple.iTunes:ISRC"] = cls._freeform(m.isrc)
 
-        # ── iTunes IDs ────────────────────────────────────────────────────
         itunes_ids = (
             ("itunes_track_id",      "iTunes_CDDB_TrackNumber"),
             ("itunes_artist_id",     "iTunes_CDDB_ArtistID"),
@@ -116,7 +106,6 @@ class SongMetaWriter:
             if v:
                 tags[f"----:com.apple.iTunes:{atom}"] = cls._freeform(str(v))
 
-        # ── MusicBrainz IDs ───────────────────────────────────────────────
         mb_ids = (
             ("mb_track_id",         "MusicBrainz Track Id"),
             ("mb_album_id",         "MusicBrainz Album Id"),
@@ -131,11 +120,8 @@ class SongMetaWriter:
 
         return tags
 
-    # ── Cover ────────────────────────────────────────────────────────────────
-
     @classmethod
     def _fetch_cover(cls, url: Optional[str], timeout: float = 10.0) -> Optional[bytes]:
-        """Scarica la cover; se l'URL è Spotify/iTunes, forza la massima risoluzione disponibile."""
         if not url:
             return None
         url = cls._upscale_cover_url(url)
@@ -150,13 +136,10 @@ class SongMetaWriter:
 
     @staticmethod
     def _upscale_cover_url(url: str) -> str:
-        """Forza risoluzione massima per URL iTunes (Spotify è già full-res di default)."""
         if "mzstatic.com" in url:
             import re
             url = re.sub(r"/\d+x\d+(bb)?\.(jpg|png)", r"/3000x3000\1.\2", url)
         return url
-
-    # ── Scrittura file ───────────────────────────────────────────────────────
 
     @staticmethod
     def _write_to_file(path: str, tags: dict, cover: Optional[bytes]) -> None:

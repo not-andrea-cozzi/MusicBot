@@ -1,4 +1,4 @@
-# SongProcessor.py
+# Pipeline/SongProcessor.py
 from __future__ import annotations
 
 import asyncio
@@ -36,10 +36,6 @@ _VARIOUS_ARTISTS_TOKENS = ("various artists", "aa.vv.", "artisti vari")
 
 
 class SongProcessor:
-    """
-    Orchestratore per-song: seed → enrich (pipeline) → post-process → cover → tag → rename.
-    Istanziato per-thread da BotOrchestrator (pipeline non condivisa tra thread).
-    """
 
     def __init__(
         self,
@@ -121,7 +117,6 @@ class SongProcessor:
 
     @staticmethod
     def _recover_album_from_playlist(seed: dict, info: dict) -> None:
-        """Mutazione in-place di seed['album'] sulla base del playlist_title, se utile."""
         playlist_title = info.get("playlist_title", "") or ""
         if not playlist_title:
             return
@@ -135,8 +130,6 @@ class SongProcessor:
             ):
                 seed["album"] = playlist_album
 
-        # Recupera album da playlist_title se yt-dlp ha messo un fake single
-        # es. album="Controlla - Single" ma playlist_title="Drake 'Views' Album"
         raw_album = seed.get("album", "")
         if raw_album and FakeAlbumSuffix.has(raw_album):
             if alb_match := _QUOTED_ALBUM_RE.search(playlist_title):
@@ -166,6 +159,14 @@ class SongProcessor:
 
         m.set_if_empty("media_type", 1)
 
+        # ── NUOVO: flag matched — determina se il file va rinominato col
+        # titolo "arricchito" (match confermato da un provider) o col
+        # titolo originale grezzo (nessun match affidabile trovato).
+        m.matched = bool(
+            m.itunes_track_id or m.mb_track_id or m.isrc or m._ytmusic_score >= 0.90
+        )
+        song.matched = m.matched
+
     # ── cover ────────────────────────────────────────────────────────────────
 
     def _fetch_cover(self, song: Song) -> Optional[bytes]:
@@ -183,31 +184,46 @@ class SongProcessor:
             self.logger.warning(f"[SongProcessor] Cover fallita {song.video_id}: {exc}")
             return None
 
+    # ── rename helper ────────────────────────────────────────────────────────
+
+    def _build_rename_meta(self, song: Song) -> dict:
+        """
+        Se la song non è stata confermata da nessun provider (song.matched
+        False), usa titolo/artista GREZZI (song.raw) per il rename invece
+        del titolo "pulito"/arricchito in song.meta — così un match errato
+        o assente non sovrascrive il nome file con dati inventati/sbagliati.
+        """
+        rename_meta = dict(song.meta.to_dict())
+        if not song.matched:
+            raw_title  = song.raw.get("title", "") or song.meta.title
+            raw_artist = song.raw.get("artist", "") or song.meta.artist
+            rename_meta["title"]  = raw_title
+            rename_meta["artist"] = raw_artist
+            self.logger.debug(
+                f"[SongProcessor] Nessun match confermato, rename con titolo originale: {raw_title!r}"
+            )
+        return rename_meta
+
     # ── pipeline ─────────────────────────────────────────────────────────────
 
     async def _process_async(self, song: Song) -> None:
         seed = self._build_seed(song)
         song.meta.apply(seed)
 
-        # ── enrich ───────────────────────────────────────────────────────────
         try:
             await self.pipeline.run(song)
         except Exception as exc:
             self.logger.error(f"[SongProcessor] Pipeline fallita {song.video_id}: {exc}", exc_info=True)
 
-        # ── post-process ─────────────────────────────────────────────────────
         self._postprocess_meta(song)
 
-        # ── validazione file ────────────────────────────────────────────────
         if not song.path_current or not os.path.isfile(song.path_current):
             song.mark_error(f"File non trovato: {song.path_current!r}")
             self.logger.error(f"[SongProcessor] {song.error}")
             return
 
-        # ── cover ────────────────────────────────────────────────────────────
         cover = self._fetch_cover(song)
 
-        # ── write tags ───────────────────────────────────────────────────────
         try:
             song.write_tags(cover_override=cover)
         except Exception as exc:
@@ -215,9 +231,9 @@ class SongProcessor:
             self.logger.error(f"[SongProcessor] {song.error}")
             return
 
-        # ── rename & finalize ────────────────────────────────────────────────
         try:
-            final_path = self.files.rename_file(song.path_current, song.meta, self.output_dir)
+            rename_meta = self._build_rename_meta(song)
+            final_path = self.files.rename_file(song.path_current, rename_meta, self.output_dir)
         except Exception as exc:
             self.logger.warning(f"[SongProcessor] Rename fallito {song.video_id}: {exc}")
             final_path = song.path_current
@@ -229,7 +245,6 @@ class SongProcessor:
     # ── shutdown ─────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Chiude le risorse async della pipeline (se presenti), in modo sync-safe."""
         async def _close_all():
             if hasattr(self.pipeline, "aclose"):
                 await self.pipeline.aclose()
