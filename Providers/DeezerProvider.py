@@ -8,6 +8,41 @@ from typing import Optional
 
 import httpx
 
+# Providers/DeezerProvider.py — aggiungere in cima al file, accanto agli altri import/regex
+
+_ALT_VERSION_RE = re.compile(
+    r'\b(instrumental(?:s)?|karaoke|a\s*cappella(?:s)?|acapella(?:s)?|sped\s*up|'
+    r'nightcore|slowed(?:\s*(?:and|&)?\s*reverb(?:ed)?)?|8d\s*audio|tiktok\s*remix)\b',
+    re.IGNORECASE,
+)
+
+_VERSION_TAG_RE = re.compile(
+    r'\b(?:remix|re-?mix|radio\s+edit|extended|vip|club\s+mix|'
+    r'dub\s+mix|original\s+mix|acoustic|live|demo)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_alt_version(text: str) -> bool:
+    return bool(text) and bool(_ALT_VERSION_RE.search(text))
+
+
+def _has_version_tag(text: str) -> bool:
+    return bool(text) and bool(_VERSION_TAG_RE.search(text))
+
+
+def _title_similarity_simple(a: str, b: str) -> float:
+    """Similarity locale senza dipendenza da TextCleaner (evita import circolare)."""
+    if not a or not b:
+        return 0.0
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b:
+        return 1.0
+    ta, tb = set(re.findall(r"\w+", a)), set(re.findall(r"\w+", b))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
 
 def _clean_query_term(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
@@ -442,3 +477,157 @@ class DeezerProvider:
             "year":              year,
             "genre":             genre,
         }
+    
+    # Providers/DeezerProvider.py — aggiungere questi metodi dentro class DeezerProvider
+
+    async def search_recording(
+        self,
+        title: str,
+        artist: str = "",
+        album_hint: str = "",
+        duration_ms: Optional[int] = None,
+        isrc: str = "",
+        min_score: float = 0.5,
+    ) -> dict:
+        """
+        Ricerca strutturata equivalente a MusicBrainzApiRequstor.find_best_recording.
+        Priorità: ISRC diretto -> search testuale con filtro alt-version esplicito.
+
+        Ritorna un dict "raw" compatibile con MetaMapper.from_deezer_isrc,
+        con chiavi aggiuntive:
+          - "_release_edition_kind": "single" | "ep" | "album" | "compilation" | "unknown"
+          - "_alt_version_rejected": bool (True se scartati candidati per alt-version)
+        """
+        if not title:
+            return {}
+
+        title_has_remix = _has_version_tag(title)
+        alt_rejected = False
+
+        # 1. ISRC diretto
+        if isrc:
+            raw = await self.get_by_isrc(isrc)
+            if raw:
+                cand_title = raw.get("title", "")
+                if _is_alt_version(cand_title) and not _is_alt_version(title):
+                    self.log.debug(f"[Deezer] ISRC {isrc} -> alt-version scartata: {cand_title!r}")
+                    alt_rejected = True
+                elif title_has_remix and not _has_version_tag(cand_title):
+                    self.log.debug(f"[Deezer] ISRC {isrc} -> tag versione incoerente: {cand_title!r}")
+                else:
+                    raw["_release_edition_kind"] = await self._edition_kind_for_track_raw(raw)
+                    raw["_alt_version_rejected"] = False
+                    return raw
+
+        # 2. Search testuale
+        data = await self._search_with_fallback(15, track=title, artist=artist, album=album_hint)
+        if not data:
+            return {}
+
+        best, best_score = None, -1.0
+        for t in data:
+            t_title = t.get("title", "")
+
+            if _is_alt_version(t_title) and not _is_alt_version(title):
+                alt_rejected = True
+                continue
+
+            if title_has_remix and not _has_version_tag(t_title):
+                continue
+
+            title_sim = _title_similarity_simple(title, t_title)
+            if title_sim < 0.55:
+                continue
+
+            t_artist = (t.get("artist") or {}).get("name", "")
+            artist_sim = _title_similarity_simple(artist, t_artist) if artist else 1.0
+            if artist and artist_sim < 0.5:
+                continue
+
+            score = 0.6 * title_sim + 0.4 * artist_sim
+            cand_ms = t.get("duration")
+            if duration_ms and cand_ms:
+                delta = abs(duration_ms - int(cand_ms) * 1000)
+                if delta <= 5000:
+                    score += 0.05
+
+            if score > best_score:
+                best_score, best = score, t
+
+        # Fallback: se il tag era obbligatorio e nessun candidato lo aveva,
+        # riprova senza il vincolo di tag (ultima risorsa, come MB include_version_tag).
+        if not best and title_has_remix:
+            for t in data:
+                t_title = t.get("title", "")
+                if _is_alt_version(t_title) and not _is_alt_version(title):
+                    continue
+                title_sim = _title_similarity_simple(title, t_title)
+                if title_sim < 0.55:
+                    continue
+                if title_sim > best_score:
+                    best_score, best = title_sim, t
+
+        if not best or best_score < min_score:
+            return {}
+
+        track_id = best.get("id")
+        track_data = await self._get_track_data(track_id) if track_id else {}
+        album = best.get("album", {})
+        album_id = album.get("id")
+
+        artist_collection = ", ".join(
+            c.get("name", "") for c in track_data.get("contributors", []) if c.get("name")
+        )
+
+        result = {
+            "title":             best.get("title", ""),
+            "artist":            best.get("artist", {}).get("name", ""),
+            "artist_collection": artist_collection,
+            "album":             album.get("title", ""),
+            "cover_url":         _best_cover(album),
+            "duration_ms":       int(best.get("duration", 0)) * 1000,
+            "isrc":              track_data.get("isrc", ""),
+            "explicit":          bool(track_data.get("explicit_lyrics", False)),
+            "_alt_version_rejected": alt_rejected,
+        }
+
+        if track_data:
+            result["track_number"] = int(track_data.get("track_position", 0))
+            result["disc_number"] = int(track_data.get("disk_number", 0))
+
+        if album_id:
+            album_data = await self._get_album_data(album_id)
+            if album_data:
+                genres = album_data.get("genres", {}).get("data", [])
+                if genres:
+                    result["genre"] = genres[0].get("name", "").title()
+                rd = album_data.get("release_date", "")
+                if rd and len(rd) >= 4:
+                    result["year"] = rd[:4]
+                result["_release_edition_kind"] = self._record_type_to_edition_kind(
+                    album_data.get("record_type", ""), album_data.get("nb_tracks", 0)
+                )
+
+        return result
+
+    async def _edition_kind_for_track_raw(self, raw: dict) -> str:
+        """Risolve edition kind quando il match arriva da get_by_isrc (non ha album_id diretto in raw)."""
+        album_title = raw.get("album", "")
+        if not album_title:
+            return "unknown"
+        return "unknown"  # get_by_isrc non espone record_type; kind resta unknown, non blocca il guard
+
+    @staticmethod
+    def _record_type_to_edition_kind(record_type: str, track_count: int) -> str:
+        rt = (record_type or "").lower()
+        if rt == "single":
+            return "single"
+        if rt == "ep":
+            return "ep"
+        if rt == "album":
+            return "album"
+        if rt == "compile":
+            return "compilation"
+        if track_count and track_count <= 2:
+            return "single"
+        return "unknown"

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from typing import Any, Dict, Optional, Tuple
-from sqlalchemy.orm import selectinload
+from typing import Any, Dict, Optional
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
+
 from Algorithm.TextCleaner import TextCleaner
 from Helpers.MusicBrainzHelper import MusicBrainzHelper
 from Helpers.MetaMapper import MetaMapper
@@ -22,7 +22,6 @@ from Algorithm.BestMatch import TrackMatcher
 from Providers.SpotifyProvider import SpotifyProvider
 from Utils.MusicPatterns import MusicPatterns
 from Database.Model.ItunesModel import AppleMusicAlbum, AppleMusicTrack
-from Database.Service.TrackService import TrackService
 from Database.Service.AlbumService import AlbumService
 
 
@@ -30,36 +29,19 @@ class MetadataPipeline:
     """
     Orchestratore enrichment per-song.
 
-    Fasi (in ordine, ognuna può fare return anticipato via ctx):
-      1. Spotify          → opzionale, fornisce ISRC + artisti accurati
-      2. MusicBrainz       → opzionale, recording + release + edizione
-      3. DB locale         → se hit, read-only: NESSUN provider remoto
-         viene più interrogato e NESSUNA scrittura DB viene fatta per
-         questa song (vedi PipelineContext.db_hit_readonly)
-      4. Deezer (ISRC)     → enrichment veloce se abbiamo un ISRC
-      5. iTunes            → ricerca principale, propaga release_edition
-      6. artist_collection → risoluzione featuring/collaboratori
-      7. Deezer (fallback) → completa i campi ancora mancanti
-
-    Rispetto alla versione precedente: niente più doppia chiamata a
-    _step_local_db, niente più tuple posizionali passate a mano tra step
-    (tutto vive in PipelineContext), e ogni punto che tocca un ISRC
-    condiviso tra provider verifica la compatibilità di ReleaseEdition
-    prima di fondere campi di release (track_number/disc_number/album).
-
-    NUOVO (fix MB/Spotify "Remix non trovato"):
-    Quando il titolo originale richiede esplicitamente un tag di versione
-    (remix/live/acoustic/ecc.) ma il miglior candidato MB o Spotify trovato
-    non lo ha nel proprio titolo, viene tentato UN secondo giro di ricerca
-    più permissivo prima di arrendersi:
-      - MB:      query con tag di versione incluso nella phrase query
-                 (vedi MusicBrainzApiRequstor._build_query include_version_tag).
-      - Spotify: nuova ricerca senza il filtro _EXCLUDE_TITLE_RE, accettando
-                 esplicitamente candidati con tag di versione nel titolo.
-    Se anche il fallback non produce un candidato coerente, il comportamento
-    resta quello originale (MBResult/spotify vuoti, fallback su iTunes) —
-    nessun dato viene "inventato": si amplia solo il recall della ricerca.
+    Fasi:
+      1. Spotify           → opzionale, ISRC + artisti accurati
+      2. Deezer-recording  → motore primario recording match (alt-version aware)
+      3. MusicBrainz        → fallback SOLO se Deezer-recording non trova nulla
+      4. DB locale          → hit read-only, salta tutto il resto
+      5. Deezer (ISRC)      → enrichment veloce
+      6. iTunes             → ricerca principale
+      7. artist_collection  → featuring/collaboratori
+      8. Deezer (fallback)  → completa campi mancanti
     """
+
+    _VERSION_TAG_RE = MusicPatterns.VERSION_TAG_RE
+    _DELUXE_TAG_RE = MusicPatterns.DELUXE_TAG_RE
 
     def __init__(
         self,
@@ -69,24 +51,26 @@ class MetadataPipeline:
         logger: Optional[logging.Logger] = None,
         spotify: Optional[SpotifyProvider] = None,
         use_mb: bool = True,
+        use_deezer_recording: bool = True,
         use_spotify: bool = False,
         always_fallback_cover: bool = False,
         db_session: Optional[AsyncSession] = None,
     ) -> None:
-        self.itunes                = itunes
-        self.mb                    = mb
-        self.deezer                = deezer
-        self.spotify               = spotify
-        self.use_mb                = use_mb
-        self.use_spotify           = use_spotify
+        self.itunes = itunes
+        self.mb = mb
+        self.deezer = deezer
+        self.spotify = spotify
+        self.use_mb = use_mb
+        self.use_deezer_recording = use_deezer_recording
+        self.use_spotify = use_spotify
         self.always_fallback_cover = always_fallback_cover
-        self.log                   = logger or logging.getLogger(__name__)
-        self.matcher               = TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
+        self.log = logger or logging.getLogger(__name__)
+        self.matcher = TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
         self.mb.set_matcher(self.matcher)
-        self.db_session            = db_session
-        self.guard                 = VersionGuard(logger=self.log)
+        self.db_session = db_session
+        self.guard = VersionGuard(logger=self.log)
 
-    # ── Entry point ───────────────────────────────────────────────────────────
+    # ── Entry point ──────────────────────────────────────────────────────
 
     async def run(self, song: Song) -> Song:
         song.mark_tagging()
@@ -95,17 +79,12 @@ class MetadataPipeline:
         ctx = PipelineContext.start(song)
 
         await self._phase_spotify(ctx)
-        await self._phase_musicbrainz(ctx)
+        await self._phase_recording_match(ctx)
 
         if await self._phase_local_db(ctx):
-            # Hit read-only: nessun provider remoto, nessuna scrittura DB.
             return self._finalize_from_db(ctx)
 
         await self._phase_deezer_isrc(ctx)
-
-        # Secondo tentativo DB SOLO se Deezer ha fornito un ISRC nuovo che
-        # non avevamo al primo tentativo (es. ISRC arrivato da Deezer e non
-        # da Spotify/MB). Evita la doppia query quando non cambia nulla.
         if ctx.deezer_isrc_result and not ctx.db_hit:
             if await self._phase_local_db(ctx, force=True):
                 return self._finalize_from_db(ctx)
@@ -117,57 +96,22 @@ class MetadataPipeline:
         self._finalize_compilation(ctx.song)
         return ctx.song
 
-    # ── Fase 1: Spotify ──────────────────────────────────────────────────────
+    # ── Fase Spotify ─────────────────────────────────────────────────────
 
     async def _phase_spotify(self, ctx: PipelineContext) -> None:
         if not (self.use_spotify and self.spotify and self.spotify.is_active):
             return
         song = ctx.song
-        title_has_remix = bool(MusicPatterns.VERSION_TAG_RE.search(song.meta.title))
+        title_has_remix = self._has_version_tag(song.meta.title)
 
-        try:
-            sp_track = self.spotify.search(
-                title=song.meta.title, artist=song.meta.artist, album=song.meta.album,
-                duration_ms=song.meta.duration_ms, isrc=song.meta.isrc,
-            )
-        except Exception as exc:
-            self.log.debug(f"[Pipeline][Spotify] {exc}")
-            sp_track = None
+        sp_track = await self._safe_call(
+            self.spotify.search, "Spotify",
+            title=song.meta.title, artist=song.meta.artist, album=song.meta.album,
+            duration_ms=song.meta.duration_ms, isrc=song.meta.isrc,
+        )
 
-        # NUOVO: se il primo giro non ha trovato nulla (o ha trovato un
-        # candidato senza il tag di versione richiesto), e il titolo
-        # richiede esplicitamente un tag (remix/live/ecc.), riprova con un
-        # secondo giro che accetta candidati col tag — coprendo i casi in
-        # cui SpotifyProvider._pick_best ha scartato la traccia corretta
-        # tramite _EXCLUDE_TITLE_RE pur essendo quella richiesta.
         if title_has_remix:
-            sp_track_name = (sp_track or {}).get("name", "")
-            has_tag = bool(MusicPatterns.VERSION_TAG_RE.search(sp_track_name)) if sp_track else False
-            if not sp_track or not has_tag:
-                try:
-                    retry_track = self.spotify.search_allow_version_tag(
-                        title=song.meta.title, artist=song.meta.artist, album=song.meta.album,
-                        duration_ms=song.meta.duration_ms, isrc="",
-                    ) if hasattr(self.spotify, "search_allow_version_tag") else None
-                except Exception as exc:
-                    self.log.debug(f"[Pipeline][Spotify] retry tag: {exc}")
-                    retry_track = None
-
-                if retry_track and MusicPatterns.VERSION_TAG_RE.search(retry_track.get("name", "")):
-                    self.log.debug(
-                        f"[Pipeline][Spotify] retry con tag versione riuscito: "
-                        f"'{retry_track.get('name')}'"
-                    )
-                    sp_track = retry_track
-                elif sp_track and not has_tag:
-                    # Il primo giro aveva trovato qualcosa ma senza il tag
-                    # richiesto: non fidarsi, è quasi certamente la versione
-                    # originale, non la remix/live cercata.
-                    self.log.debug(
-                        f"[Pipeline][Spotify] match '{sp_track.get('name')}' incoerente "
-                        f"col tag di versione richiesto da '{song.meta.title}', scartato."
-                    )
-                    sp_track = None
+            sp_track = await self._spotify_retry_with_tag(song, sp_track)
 
         if not sp_track:
             self.log.debug(f"[Pipeline][Spotify] miss: '{ctx.original_title}'")
@@ -179,12 +123,92 @@ class MetadataPipeline:
         self.log.info(f"[Pipeline][Spotify] '{sp_mapped.get('title')}' ISRC={ctx.spotify_isrc!r}")
         song.meta.apply(sp_mapped, overwrite_keys={"artist_collection", "artist"})
 
-    # ── Fase 2: MusicBrainz ──────────────────────────────────────────────────
+    async def _spotify_retry_with_tag(self, song: Song, sp_track: Optional[dict]) -> Optional[dict]:
+        has_tag = bool(sp_track) and self._has_version_tag((sp_track or {}).get("name", ""))
+        if sp_track and has_tag:
+            return sp_track
 
-    async def _phase_musicbrainz(self, ctx: PipelineContext) -> None:
-        if not self.use_mb:
+        retry = None
+        if hasattr(self.spotify, "search_allow_version_tag"):
+            retry = await self._safe_call(
+                self.spotify.search_allow_version_tag, "Spotify retry-tag",
+                title=song.meta.title, artist=song.meta.artist, album=song.meta.album,
+                duration_ms=song.meta.duration_ms, isrc="",
+            )
+
+        if retry and self._has_version_tag(retry.get("name", "")):
+            self.log.debug(f"[Pipeline][Spotify] retry tag riuscito: '{retry.get('name')}'")
+            return retry
+        if sp_track and not has_tag:
+            self.log.debug(f"[Pipeline][Spotify] match senza tag versione richiesto, scartato.")
+            return None
+        return sp_track
+
+    # ── Fase recording match: Deezer primario, MB fallback ──────────────
+
+    async def _phase_recording_match(self, ctx: PipelineContext) -> None:
+        if self.use_deezer_recording:
+            await self._resolve_deezer_recording(ctx)
+
+        if not ctx.mb_result.found and self.use_mb:
+            await self._resolve_musicbrainz(ctx)
+
+    async def _resolve_deezer_recording(self, ctx: PipelineContext) -> None:
+        song = ctx.song
+        raw_title = song.meta.title.strip()
+        raw_artist = song.meta.artist.strip()
+        raw_album = song.meta.album.strip()
+        isrc_hint = song.meta.isrc.strip()
+
+        raw = await self._safe_call(
+            self.deezer.search_recording, "Deezer-Recording",
+            title=raw_title, artist=raw_artist, album_hint=raw_album,
+            duration_ms=song.meta.duration_ms, isrc=isrc_hint, min_score=0.5,
+        ) or {}
+
+        if not raw:
+            self.log.debug(f"[Pipeline][Deezer-Recording] miss: '{raw_title}'")
             return
 
+        found_isrc = raw.get("isrc", "")
+        matched_by_isrc = bool(isrc_hint and found_isrc and found_isrc.upper() == isrc_hint.upper())
+        title_sim = TextCleaner.title_similarity(
+            TextCleaner.normalize(raw_title), TextCleaner.normalize(raw.get("title", ""))
+        )
+        score = 1.0 if matched_by_isrc else max(title_sim, 0.5)
+        confidence = self._confidence_from_score(score, is_isrc_exact=matched_by_isrc)
+
+        edition = ReleaseEdition.from_deezer_kind(
+            raw.get("_release_edition_kind", "unknown"),
+            title_norm=TextCleaner.normalize(raw_title),
+        )
+
+        ctx.mb_result = MBResult(
+            recording={"title": raw.get("title", ""), "isrcs": [found_isrc] if found_isrc else []},
+            album={"title": raw["album"]} if raw.get("album") else None,
+            track_score=score,
+            confidence=confidence,
+            isrc=found_isrc,
+            title_has_remix=self._has_version_tag(raw_title),
+            release_edition=edition,
+        )
+
+        if found_isrc:
+            song.meta.set_if_empty("isrc", found_isrc)
+
+        overwrite = {"cover_url", "genre"}
+        if not raw.get("_alt_version_rejected"):
+            overwrite.add("year")
+        song.meta.apply(raw, overwrite_keys=overwrite)
+
+        ctx.mb_track_disc = {k: raw[k] for k in ("track_number", "disc_number") if raw.get(k)}
+
+        self.log.info(
+            f"[Pipeline][Deezer-Recording] '{raw.get('title')}' "
+            f"confidence={confidence.name} ISRC={found_isrc!r}"
+        )
+
+    async def _resolve_musicbrainz(self, ctx: PipelineContext) -> None:
         mb_result = await self._resolve_mb(ctx.song)
         ctx.mb_result = mb_result
         song = ctx.song
@@ -192,114 +216,120 @@ class MetadataPipeline:
         if mb_result.found:
             await self._apply_mb_country(mb_result.recording)
             song.meta.set_if_empty("isrc", mb_result.isrc)
-            self.log.debug(f"[Pipeline] MB confidence={mb_result.confidence.name} edition={mb_result.release_edition.describe() if mb_result.release_edition else 'n/a'}")
+            edition_desc = mb_result.release_edition.describe() if mb_result.release_edition else "n/a"
+            self.log.debug(f"[Pipeline] MB(fallback) confidence={mb_result.confidence.name} edition={edition_desc}")
         else:
-            self.log.warning(f"[Pipeline] MB miss: '{ctx.original_title}'")
+            self.log.warning(f"[Pipeline] MB(fallback) miss: '{ctx.original_title}'")
 
         ctx.mb_track_disc = self._resolve_mb_track_disc(song, mb_result)
 
     async def _resolve_mb(self, song: Song) -> MBResult:
-        raw_title  = song.meta.title.strip()
+        raw_title = song.meta.title.strip()
         raw_artist = song.meta.artist.strip()
-        raw_album  = song.meta.album.strip()
-        isrc_hint  = song.meta.isrc.strip()
-        duration   = song.meta.duration_ms
+        raw_album = song.meta.album.strip()
+        isrc_hint = song.meta.isrc.strip()
+        duration = song.meta.duration_ms
 
-        clean_artist    = TextCleaner.clean_text(raw_artist, field_type="artist")
-        clean_title     = TextCleaner.clean_text(raw_title, artist=clean_artist, field_type="title")
-        clean_album     = TextCleaner.normalize(raw_album)
-        title_has_remix = bool(MusicPatterns.VERSION_TAG_RE.search(raw_title))
+        clean_artist = TextCleaner.clean_text(raw_artist, field_type="artist")
+        clean_title = TextCleaner.clean_text(raw_title, artist=clean_artist, field_type="title")
+        clean_album = TextCleaner.normalize(raw_album)
+        title_has_remix = self._has_version_tag(raw_title)
 
-        best_score, best_rec_raw = -1.0, None
-        # True solo se il match vincente proviene da un fetch_by_isrc riuscito
-        # E coerente col tag di versione del titolo. Determina se la
-        # confidence finale può legittimamente essere ISRC_EXACT.
-        isrc_fetch_trusted = False
+        best_score, best_rec_raw, isrc_fetch_trusted = await self._mb_isrc_attempt(
+            isrc_hint, raw_title, title_has_remix, clean_title, clean_artist, clean_album, duration
+        )
 
-        if isrc_hint:
-            rec = await self.mb.fetch_by_isrc(isrc_hint)
-            if rec and self._isrc_fetch_is_trustworthy(rec, raw_title, title_has_remix):
-                score = self.matcher.score_candidate(
-                    title=clean_title, artist=clean_artist, album_hint=clean_album,
-                    duration_ms=duration, isrc=isrc_hint,
-                    candidate=self.mb._recording_to_candidate(rec),
-                )
-                if score and score > best_score:
-                    best_score, best_rec_raw, isrc_fetch_trusted = score, rec, True
-            elif rec:
-                self.log.debug(
-                    f"[Pipeline] ISRC hint {isrc_hint!r} scartato: titolo MB "
-                    f"{self.mb._recording_title(rec)!r} incoerente col tag di "
-                    f"versione di '{raw_title}' (probabile ISRC errato a monte, "
-                    f"es. da yt-dlp/YouTube Music legato all'originale invece "
-                    f"che alla versione richiesta)."
-                )
-
-        # Ricerca testuale: SEMPRE eseguita se il fetch ISRC non ha prodotto
-        # un match affidabile, anche se isrc_hint era presente. In precedenza
-        # un isrc_hint "valido ma incoerente" saltava del tutto questo passo.
         if not isrc_fetch_trusted:
-            query = self.mb._build_query(raw_title, raw_artist, raw_album)
-            for rec in await self.mb._search_recordings(query):
-                score = self.matcher.score_candidate(
-                    title=clean_title, artist=clean_artist, album_hint=clean_album,
-                    duration_ms=duration, isrc=isrc_hint,
-                    candidate=self.mb._recording_to_candidate(rec),
-                )
-                if score and score > best_score:
-                    best_score, best_rec_raw = score, rec
-
-            # NUOVO: se il titolo richiede un tag di versione esplicito ma il
-            # miglior candidato trovato non lo ha nel proprio titolo MB,
-            # tenta un secondo giro con la query che include il tag come
-            # parte della phrase query. Accetta SOLO candidati che abbiano
-            # davvero il tag nel titolo, per non sostituire un match
-            # legittimo con uno peggiore solo perché "ha il tag per caso".
-            best_title_now = self.mb._recording_title(best_rec_raw) if best_rec_raw else ""
-            if title_has_remix and not MusicPatterns.VERSION_TAG_RE.search(best_title_now):
-                tagged_query = self.mb._build_query(
-                    raw_title, raw_artist, raw_album, include_version_tag=True
-                )
-                if tagged_query != query:
-                    for rec in await self.mb._search_recordings(tagged_query):
-                        cand_title = self.mb._recording_title(rec)
-                        if not MusicPatterns.VERSION_TAG_RE.search(cand_title):
-                            continue
-                        score = self.matcher.score_candidate(
-                            title=clean_title, artist=clean_artist, album_hint=clean_album,
-                            duration_ms=duration, isrc=isrc_hint,
-                            candidate=self.mb._recording_to_candidate(rec),
-                        )
-                        if score and score > best_score:
-                            best_score, best_rec_raw = score, rec
-                            self.log.debug(
-                                f"[Pipeline][MB] fallback con tag versione riuscito: "
-                                f"'{cand_title}' score={score:.2f}"
-                            )
+            best_score, best_rec_raw = await self._mb_text_search(
+                raw_title, raw_artist, raw_album, title_has_remix,
+                clean_title, clean_artist, clean_album, duration, isrc_hint,
+                best_score, best_rec_raw,
+            )
 
         if not best_rec_raw or best_score < 0.35:
             return MBResult()
 
+        return await self._build_mb_result(
+            best_rec_raw, best_score, isrc_hint, duration, title_has_remix, clean_album, raw_title, clean_title,
+            isrc_fetch_trusted,
+        )
+
+    async def _mb_isrc_attempt(
+        self, isrc_hint, raw_title, title_has_remix, clean_title, clean_artist, clean_album, duration,
+    ) -> tuple[float, Optional[Dict], bool]:
+        if not isrc_hint:
+            return -1.0, None, False
+
+        rec = await self.mb.fetch_by_isrc(isrc_hint)
+        if not rec:
+            return -1.0, None, False
+
+        if not self._isrc_fetch_is_trustworthy(rec, raw_title, title_has_remix):
+            self.log.debug(
+                f"[Pipeline] ISRC hint {isrc_hint!r} scartato: titolo MB "
+                f"{self.mb._recording_title(rec)!r} incoerente col tag versione."
+            )
+            return -1.0, None, False
+
+        score = self.matcher.score_candidate(
+            title=clean_title, artist=clean_artist, album_hint=clean_album,
+            duration_ms=duration, isrc=isrc_hint, candidate=self.mb._recording_to_candidate(rec),
+        )
+        if score:
+            return score, rec, True
+        return -1.0, None, False
+
+    async def _mb_text_search(
+        self, raw_title, raw_artist, raw_album, title_has_remix,
+        clean_title, clean_artist, clean_album, duration, isrc_hint,
+        best_score, best_rec_raw,
+    ) -> tuple[float, Optional[Dict]]:
+        query = self.mb._build_query(raw_title, raw_artist, raw_album)
+        for rec in await self.mb._search_recordings(query):
+            score = self.matcher.score_candidate(
+                title=clean_title, artist=clean_artist, album_hint=clean_album,
+                duration_ms=duration, isrc=isrc_hint, candidate=self.mb._recording_to_candidate(rec),
+            )
+            if score and score > best_score:
+                best_score, best_rec_raw = score, rec
+
+        best_title_now = self.mb._recording_title(best_rec_raw) if best_rec_raw else ""
+        if title_has_remix and not self._has_version_tag(best_title_now):
+            tagged_query = self.mb._build_query(raw_title, raw_artist, raw_album, include_version_tag=True)
+            if tagged_query != query:
+                for rec in await self.mb._search_recordings(tagged_query):
+                    cand_title = self.mb._recording_title(rec)
+                    if not self._has_version_tag(cand_title):
+                        continue
+                    score = self.matcher.score_candidate(
+                        title=clean_title, artist=clean_artist, album_hint=clean_album,
+                        duration_ms=duration, isrc=isrc_hint, candidate=self.mb._recording_to_candidate(rec),
+                    )
+                    if score and score > best_score:
+                        best_score, best_rec_raw = score, rec
+                        self.log.debug(f"[Pipeline][MB] fallback tag versione riuscito: '{cand_title}'")
+
+        return best_score, best_rec_raw
+
+    async def _build_mb_result(
+        self, best_rec_raw, best_score, isrc_hint, duration, title_has_remix,
+        clean_album, raw_title, clean_title, isrc_fetch_trusted,
+    ) -> MBResult:
         recording = await self.mb.fetch_recording_by_id(
-            best_rec_raw["id"],
-            inc_params="releases+media+artist-credits+isrcs+release-groups+tags+genres",
+            best_rec_raw["id"], inc_params="releases+media+artist-credits+isrcs+release-groups+tags+genres",
         )
         if not recording:
             return MBResult()
 
-        final_isrc   = (recording.get("isrcs") or [""])[0] or (best_rec_raw.get("isrcs") or [""])[0]
-        confidence   = self._mb_confidence(
-            best_score, final_isrc, isrc_hint, duration, recording.get("length"),
-            isrc_fetch_trusted=isrc_fetch_trusted,
-        )
-        releases     = recording.get("releases", [])
+        final_isrc = (recording.get("isrcs") or [""])[0] or (best_rec_raw.get("isrcs") or [""])[0]
+        confidence = self._mb_confidence(best_score, final_isrc, isrc_hint, duration, recording.get("length"), isrc_fetch_trusted)
+        releases = recording.get("releases", [])
         best_release = self._pick_best_release(releases, clean_album, raw_title)
-        album_score  = 0.0
+        album_score = 0.0
 
         if clean_album and best_release:
             album_score = TextCleaner.album_edition_similarity(
-                clean_album,
-                TextCleaner.clean_text(best_release.get("title", ""), field_type="album"),
+                clean_album, TextCleaner.clean_text(best_release.get("title", ""), field_type="album"),
             )
 
         release_edition = (
@@ -308,43 +338,21 @@ class MetadataPipeline:
         )
 
         return MBResult(
-            recording=recording,
-            album=best_release,
-            track_score=best_score,
-            album_score=album_score,
-            confidence=confidence,
-            isrc=final_isrc,
-            album_is_deluxe=bool(MusicPatterns.DELUXE_TAG_RE.search((best_release or {}).get("title", ""))),
-            title_has_remix=title_has_remix,
-            release_edition=release_edition,
+            recording=recording, album=best_release, track_score=best_score, album_score=album_score,
+            confidence=confidence, isrc=final_isrc,
+            album_is_deluxe=bool(self._DELUXE_TAG_RE.search((best_release or {}).get("title", ""))),
+            title_has_remix=title_has_remix, release_edition=release_edition,
         )
 
     def _isrc_fetch_is_trustworthy(self, rec: Dict, original_title: str, title_has_remix: bool) -> bool:
-        """
-        Valida che la recording ottenuta da fetch_by_isrc sia coerente col
-        tag di versione del titolo cercato, prima di fidarsi ciecamente
-        dell'ISRC fornito a monte (yt-dlp/YouTube Music spesso lega un
-        video remix all'ISRC del brano originale, o viceversa).
-
-        Regola, simmetrica a quella già usata in MusicBrainzApiRequstor
-        per le alt-version (instrumental/karaoke/ecc.):
-        - Se il titolo originale richiede un tag di versione (remix/live/
-          acoustic/...) e la recording MB risultante NON lo ha nel titolo,
-          l'ISRC è sospetto → non fidarsi.
-        - Il contrario non è penalizzato: un ISRC che porta a una recording
-          con tag di versione quando il titolo originale non lo richiedeva
-          esplicitamente resta accettabile (capita che MB disambiguifichi
-          più di quanto serva).
-        """
         if not title_has_remix:
             return True
-        cand_title = self.mb._recording_title(rec)
-        return bool(MusicPatterns.VERSION_TAG_RE.search(cand_title))
+        return self._has_version_tag(self.mb._recording_title(rec))
 
     def _pick_best_release(self, releases: list, clean_album: str, original_title: str) -> Dict:
         if not releases:
             return {}
-        wants_alt  = MusicPatterns.is_alt_version(original_title)
+        wants_alt = MusicPatterns.is_alt_version(original_title)
         candidates = releases if wants_alt else [
             r for r in releases if not MusicPatterns.is_alt_version(r.get("title", ""))
         ]
@@ -360,26 +368,15 @@ class MetadataPipeline:
                 best_score, best_release = sim, r
         return best_release
 
-    # ── Fase 3: DB locale ────────────────────────────────────────────────────
+    # ── Fase DB locale ────────────────────────────────────────────────────
 
     async def _phase_local_db(self, ctx: PipelineContext, force: bool = False) -> bool:
-        """
-        Popola ctx.db_hit/db_hit_readonly se trova un match locale.
-        Ritorna True se la pipeline deve fermarsi qui (DB hit valido).
-
-        `force=True` permette un secondo tentativo dopo che Deezer ha
-        fornito un nuovo ISRC, ma solo se non avevamo già un hit.
-        """
         if not self.db_session or (ctx.db_hit and not force):
             return bool(ctx.db_hit_readonly and ctx.db_hit)
 
         isrc = ctx.search_isrc
         song = ctx.song
-        try:
-            db_hit = await self._lookup_local_db(song, isrc)
-        except Exception as exc:
-            self.log.debug(f"[Pipeline][DB] query fallita: {exc}")
-            db_hit = {}
+        db_hit = await self._safe_call(self._lookup_local_db, "DB", song, isrc) or {}
 
         if not db_hit:
             return False
@@ -390,75 +387,33 @@ class MetadataPipeline:
         return True
 
     async def _lookup_local_db(self, song: Song, isrc: str) -> Dict[str, Any]:
-        title_has_remix = bool(MusicPatterns.VERSION_TAG_RE.search(song.meta.title))
+        title_has_remix = self._has_version_tag(song.meta.title)
 
         if isrc:
             track = await self._db_track_by_isrc(isrc, song.meta.album, song.meta.title)
             if track and self._db_track_matches_version(track, title_has_remix):
                 return await self._db_track_to_meta(track)
             if track:
-                self.log.debug(
-                    f"[Pipeline][DB] ISRC {isrc!r} trovato ma titolo DB "
-                    f"{track.track_name!r} incoerente col tag di versione "
-                    f"richiesto da '{song.meta.title}' — scartato, ricado "
-                    f"sul fallback per titolo/artista."
-                )
+                self.log.debug(f"[Pipeline][DB] ISRC {isrc!r} incoerente col tag versione, fallback titolo/artista.")
 
-        title_norm  = TextCleaner.normalize(song.meta.title)
+        title_norm = TextCleaner.normalize(song.meta.title)
         artist_norm = TextCleaner.normalize(TextCleaner.primary_artist(song.meta.artist))
         if not title_norm:
             return {}
 
-        track = await self._db_track_by_title_artist(
-            title_norm, artist_norm, song.meta.album, song.meta.duration_ms,
-            )
+        track = await self._db_track_by_title_artist(title_norm, artist_norm, song.meta.album, song.meta.duration_ms)
         if track and not self._db_track_matches_version(track, title_has_remix):
-            self.log.debug(
-                f"[Pipeline][DB] Match per titolo/artista {track.track_name!r} "
-                f"incoerente col tag di versione richiesto, scartato."
-            )
+            self.log.debug(f"[Pipeline][DB] Match titolo/artista incoerente col tag versione, scartato.")
             return {}
         return await self._db_track_to_meta(track) if track else {}
 
     @staticmethod
     def _db_track_matches_version(track: AppleMusicTrack, title_has_remix: bool) -> bool:
-        """
-        Stessa regola applicata in _isrc_fetch_is_trustworthy per MB: se il
-        titolo cercato richiede esplicitamente un tag di versione (remix/
-        live/acoustic/ecc.), la riga DB candidata deve averlo nel proprio
-        nome traccia. Il contrario non è penalizzato.
-        """
         if not title_has_remix:
             return True
-        return bool(MusicPatterns.VERSION_TAG_RE.search(track.track_name or ""))
+        return bool(MetadataPipeline._VERSION_TAG_RE.search(track.track_name or ""))
 
-    async def _db_track_by_isrc(
-        self, isrc: str, album_hint: str = "", title_hint: str = "",
-    ) -> Optional[AppleMusicTrack]:
-        """
-        Cerca tracce con lo stesso ISRC. Se ce ne sono più di una (caso
-        comune: stesso recording uscito come single E poi su un album, O
-        — caso concretamente osservato — l'originale e una remix/edizione
-        con featuring che condividono l'ISRC, es. "Leaked" e "Leaked
-        (feat. Lil Wayne) [Remix]" entrambe TrackId distinti nello stesso
-        album con lo stesso ISRC), NON sceglie semplicemente quella con
-        più tracce nell'album o con miglior similarity sull'album: usa
-        PRIMA la coerenza del track_name col title_hint (incluso il tag
-        di versione, remix/live/acoustic/ecc.) come filtro decisivo, e
-        SOLO come tie-break secondario considera ReleaseEdition/album.
-
-        FIX (bug riportato): la versione precedente calcolava `_score`
-        usando esclusivamente album_sim + edition_bonus, MAI confrontando
-        track.track_name con title_hint. Con due righe sullo stesso ISRC
-        appartenenti allo STESSO album (stesso album_sim, stesso
-        edition_bonus), `max()` su punteggi identici restituiva una riga
-        arbitraria (ordine di iterazione) — risultato osservato: veniva
-        scartata la riga "Leaked (feat. Lil Wayne) [Remix]" già presente
-        nel DB in favore di "Leaked", nonostante il titolo richiesto
-        ('Leaked (Remix)') richiedesse esplicitamente il tag versione, che
-        il chiamante (_lookup_local_db → _db_track_matches_version)
-        verificava SOLO dopo aver già fissato la scelta sbagliata.
-        """
+    async def _db_track_by_isrc(self, isrc: str, album_hint: str = "", title_hint: str = "") -> Optional[AppleMusicTrack]:
         stmt = select(AppleMusicTrack).where(AppleMusicTrack.isrc == isrc.upper())
         result = await self.db_session.execute(stmt)
         rows: list[AppleMusicTrack] = list(result.scalars().all())
@@ -469,44 +424,26 @@ class MetadataPipeline:
             return rows[0]
 
         title_norm = TextCleaner.normalize(title_hint) if title_hint else ""
-        title_has_remix = bool(MusicPatterns.VERSION_TAG_RE.search(title_hint)) if title_hint else False
+        title_has_remix = self._has_version_tag(title_hint) if title_hint else False
 
-        # ── Step 1 (decisivo): coerenza tag di versione sul track_name ──────
-        # Se il titolo cercato richiede esplicitamente un tag (remix/live/
-        # acoustic/...), le righe che lo hanno nel proprio track_name vanno
-        # SEMPRE preferite a quelle che non lo hanno — indipendentemente da
-        # album/edition. Se nessuna riga ha il tag (caso comune: l'utente
-        # non lo richiede, o il DB non distingue versioni), si passa pari
-        # a tutte le righe allo step 2.
         if title_has_remix:
-            tagged_rows = [
-                r for r in rows
-                if MusicPatterns.VERSION_TAG_RE.search(r.track_name or "")
-            ]
+            tagged_rows = [r for r in rows if self._VERSION_TAG_RE.search(r.track_name or "")]
             if tagged_rows:
                 rows = tagged_rows
-            # se nessuna riga ha il tag, non scartiamo: lasciamo che il
-            # chiamante (_db_track_matches_version) decida a valle, ma
-            # almeno la selezione tra le righe rimanenti userà ancora la
-            # similarity testuale allo step 1b qui sotto.
+
         if title_norm:
-            # ── Step 1b: anche senza tag obbligatorio, preferisci la riga
-            # col track_name testualmente più simile al titolo cercato.
-            # Disambigua i casi (anche senza remix) in cui due righe stesso
-            # ISRC hanno titoli leggermente diversi (es. edit/clean/etc.).
             sim_scored = [
                 (TextCleaner.title_similarity(title_norm, TextCleaner.normalize(r.track_name or "")), r)
                 for r in rows
             ]
             best_sim = max(s for s, _ in sim_scored)
-            # Mantieni solo le righe entro una tolleranza ristretta dal best,
-            # per non perdere il tie-break su album/edition tra candidati
-            # comunque validi (es. due righe identiche su album diversi).
             rows = [r for s, r in sim_scored if s >= best_sim - 0.05]
             if len(rows) == 1:
                 return rows[0]
 
-        # ── Step 2: tie-break su album/edition tra le righe rimaste ─────────
+        return await self._tie_break_by_edition(rows, title_norm, album_hint)
+
+    async def _tie_break_by_edition(self, rows: list[AppleMusicTrack], title_norm: str, album_hint: str) -> AppleMusicTrack:
         album_map: dict[int, AppleMusicAlbum] = {}
         edition_map: dict[int, ReleaseEdition] = {}
         for row in rows:
@@ -515,16 +452,13 @@ class MetadataPipeline:
                 if album:
                     album_map[row.collection_id] = album
                     edition_map[row.collection_id] = ReleaseEdition.from_collection(
-                        collection_type=album.collection_type or "",
-                        collection_name=album.collection_name or "",
-                        track_count=album.track_count or 0,
-                        title_norm=title_norm,
+                        collection_type=album.collection_type or "", collection_name=album.collection_name or "",
+                        track_count=album.track_count or 0, title_norm=title_norm,
                     )
 
         hint_norm = TextCleaner.normalize(album_hint) if album_hint else ""
         hint_edition = (
-            ReleaseEdition.from_collection(collection_name=album_hint, title_norm=title_norm)
-            if album_hint else None
+            ReleaseEdition.from_collection(collection_name=album_hint, title_norm=title_norm) if album_hint else None
         )
 
         def _score(track: AppleMusicTrack) -> float:
@@ -532,42 +466,24 @@ class MetadataPipeline:
             edition = edition_map.get(track.collection_id or 0)
             if not album:
                 return 0.0
-
             album_sim = (
                 TextCleaner.title_similarity(hint_norm, TextCleaner.normalize(album.collection_name or ""))
                 if hint_norm else 0.0
             )
-
-            # Coerenza di edizione con l'hint: se l'utente cercava esplicitamente
-            # un single (o non ha hint_album), non penalizzare un single solo
-            # perché ha meno tracce; se invece l'hint è un album, il bonus va
-            # alle release con più tracce SOLO se l'edizione è compatibile.
             edition_bonus = 0.0
             if hint_edition and edition:
-                if hint_edition.compatible_with(edition):
-                    edition_bonus = min((album.track_count or 1) / 20.0, 0.3)
-                else:
-                    edition_bonus = -0.5  # penalità: edizione richiesta diversa
+                edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
             elif edition and not edition.is_short_form:
-                # nessun hint: leggera preferenza per l'album solo come tie-break
                 edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
-
             return album_sim + edition_bonus
 
         return max(rows, key=_score)
 
-   
     def _finalize_from_db(self, ctx: PipelineContext) -> Song:
-        """
-        Applica il DB-hit e chiude la pipeline. Nessuna chiamata a provider
-        remoti, nessuna scrittura: la song è già "vera" così com'è in DB.
-        """
         song = ctx.song
         song.meta.apply(ctx.db_hit, overwrite_keys=set(ctx.db_hit.keys()))
         if ctx.mb_track_disc:
             self._apply_mb_track_disc(song, ctx.mb_track_disc)
-        self._finalize_compilation(song)
-        # artist_collection risolto via Spotify/MB se disponibili, senza toccare iTunes/DB
         ctx.accurate_artists = (ctx.spotify_mapped or {}).get("artist_collection", "")
         self._finalize_artist_collection(
             song, ctx.accurate_artists, itunes_artist_raw=ctx.db_hit.get("artist", ""),
@@ -576,70 +492,42 @@ class MetadataPipeline:
         self._finalize_compilation(song)
         return song
 
-    # ── Fase 4: Deezer ISRC ──────────────────────────────────────────────────
+    # ── Fase Deezer ISRC ─────────────────────────────────────────────────
 
     async def _phase_deezer_isrc(self, ctx: PipelineContext) -> None:
         isrc = ctx.search_isrc
         if not isrc:
-            await self._phase_deezer_no_isrc_early(ctx)
+            await self._step_deezer(ctx.song, ctx.original_title, itunes_found=False, mb_found=ctx.mb_result.found)
             return
 
-        try:
-            raw = await self.deezer.get_by_isrc(isrc)
-        except Exception as exc:
-            self.log.debug(f"[Pipeline][Deezer-ISRC] {exc}")
-            raw = {}
-
+        raw = await self._safe_call(self.deezer.get_by_isrc, "Deezer-ISRC", isrc) or {}
         if not raw:
-            self.log.debug(f"[Pipeline][Deezer-ISRC] ISRC {isrc} non trovato su Deezer")
+            self.log.debug(f"[Pipeline][Deezer-ISRC] ISRC {isrc} non trovato")
             return
 
         mapped = MetaMapper.from_deezer_isrc(raw, logger=self.log)
         ctx.deezer_isrc_result = mapped
         self.log.debug(f"[Pipeline][Deezer-ISRC] '{mapped.get('title')}' genre={mapped.get('genre')!r}")
 
-        # FIX (refactoring): track_number/disc_number sono campi specifici
-        # della RELEASE, non del recording. Un ISRC può essere condiviso tra
-        # l'originale e un remix (visto concretamente: "Brothers" e
-        # "Brothers (feat. Lil Durk) [Remix]" hanno lo stesso ISRC su
-        # iTunes/Deezer) — in quel caso Deezer restituisce il titolo e la
-        # posizione-traccia dell'edizione che ha indicizzato (spesso
-        # l'originale), non necessariamente quella richiesta. Applicarli
-        # incondizionatamente sovrascriveva un track_number corretto (o
-        # ancora da determinare via iTunes) con quello sbagliato
-        # dell'altra edizione. cover_url/explicit/genre/year restano sempre
-        # sicuri: sono tipicamente coerenti anche tra edizioni diverse dello
-        # stesso recording.
-        title_has_remix = bool(MusicPatterns.VERSION_TAG_RE.search(ctx.song.meta.title))
-        deezer_title_ok = (
-            not title_has_remix
-            or bool(MusicPatterns.VERSION_TAG_RE.search(mapped.get("title", "")))
-        )
+        title_has_remix = self._has_version_tag(ctx.song.meta.title)
+        deezer_title_ok = not title_has_remix or self._has_version_tag(mapped.get("title", ""))
 
         overwrite = {"cover_url", "explicit", "genre", "year"}
         if deezer_title_ok:
             overwrite |= {"track_number", "disc_number"}
         else:
-            self.log.debug(
-                f"[Pipeline][Deezer-ISRC] track_number/disc_number NON applicati: "
-                f"titolo Deezer {mapped.get('title')!r} incoerente col tag di "
-                f"versione richiesto da '{ctx.song.meta.title}'"
-            )
+            self.log.debug(f"[Pipeline][Deezer-ISRC] track/disc non applicati: titolo incoerente.")
 
         ctx.song.meta.apply(mapped, overwrite_keys=overwrite)
         self.log.info("[Pipeline][Deezer-ISRC] Applicato.")
 
-    async def _phase_deezer_no_isrc_early(self, ctx: PipelineContext) -> None:
-        """Senza ISRC: avvia subito il fallback completo Deezer (cover/genere/ecc)."""
-        await self._step_deezer(ctx.song, ctx.original_title, itunes_found=False, mb_found=ctx.mb_result.found)
-
-    # ── Fase 5: iTunes ───────────────────────────────────────────────────────
+    # ── Fase iTunes ──────────────────────────────────────────────────────
 
     async def _phase_itunes(self, ctx: PipelineContext) -> None:
         song = ctx.song
         mb_result = ctx.mb_result
         search_album = self._resolve_search_album(song, mb_result)
-        itunes_min   = 0.70 if mb_result.confidence == MatchConfidence.LOW else MusicPatterns.MATCHER_MIN_SCORE
+        itunes_min = 0.70 if mb_result.confidence == MatchConfidence.LOW else MusicPatterns.MATCHER_MIN_SCORE
 
         itunes_result = await self._search_itunes(
             song, override_title=ctx.original_title or mb_result.mb_title,
@@ -651,38 +539,31 @@ class MetadataPipeline:
             self._apply_itunes(song, itunes_result, mb_result, ctx.mb_track_disc, ctx.original_title, ctx.original_duration_ms)
             await self._fix_bad_year(song, mb_result)
             if ctx.search_isrc and itunes_result.data.get("itunes_track_id"):
-                await self.itunes.persist_track_isrc(
-                    int(itunes_result.data["itunes_track_id"]), ctx.search_isrc
-                )
+                await self.itunes.persist_track_isrc(int(itunes_result.data["itunes_track_id"]), ctx.search_isrc)
         else:
             self.log.warning(f"[Pipeline] iTunes miss: '{ctx.original_title}'")
             if not ctx.deezer_isrc_result and ctx.spotify_mapped:
                 song.meta.apply(ctx.spotify_mapped)
-            elif not ctx.deezer_isrc_result and self.use_mb:
+            elif not ctx.deezer_isrc_result and mb_result.found:
                 self._apply_mb_fallback(song, mb_result)
 
     async def _search_itunes(
         self, song: Song, override_title: str = "", override_album: str = "",
         override_isrc: str = "", min_score: float = MusicPatterns.MATCHER_MIN_SCORE,
     ) -> ITunesResult:
-        title    = (override_title or song.meta.title).strip()
-        artist   = song.meta.artist.strip()
-        album    = (override_album or song.meta.album).strip()
-        isrc     = (override_isrc or song.meta.isrc).strip()
+        title = (override_title or song.meta.title).strip()
+        artist = song.meta.artist.strip()
+        album = (override_album or song.meta.album).strip()
+        isrc = (override_isrc or song.meta.isrc).strip()
         duration = song.meta.duration_ms
 
         if not title:
             return ITunesResult()
 
-        try:
-            raw = await self.itunes.search(
-                title=title, song=song, artist=artist, hint_album=album,
-                duration_ms=duration, min_score=min_score,
-            )
-        except Exception as exc:
-            self.log.warning(f"[Pipeline][iTunes] {exc}")
-            return ITunesResult()
-
+        raw = await self._safe_call(
+            self.itunes.search, "iTunes",
+            title=title, song=song, artist=artist, hint_album=album, duration_ms=duration, min_score=min_score,
+        )
         if not raw:
             return ITunesResult()
 
@@ -690,13 +571,8 @@ class MetadataPipeline:
         edition = raw.pop("_release_edition", None)
         return self._build_itunes_result(raw, matched_by_isrc=matched_by_isrc, title=title, artist=artist, edition=edition)
 
-    def _build_itunes_result(
-        self, raw, matched_by_isrc=False, title="", artist="", edition: Optional[ReleaseEdition] = None,
-    ) -> ITunesResult:
-        confidence = (
-            MatchConfidence.ISRC_EXACT if matched_by_isrc
-            else self._itunes_confidence(raw, title, artist)
-        )
+    def _build_itunes_result(self, raw, matched_by_isrc=False, title="", artist="", edition: Optional[ReleaseEdition] = None) -> ITunesResult:
+        confidence = MatchConfidence.ISRC_EXACT if matched_by_isrc else self._itunes_confidence(raw, title, artist)
         return ITunesResult(
             data=raw, confidence=confidence, matched_by_isrc=matched_by_isrc,
             itunes_track_number=raw.get("track_number"), itunes_disc_number=raw.get("disc_number"),
@@ -704,7 +580,7 @@ class MetadataPipeline:
             itunes_album=raw.get("album", ""), release_edition=edition,
         )
 
-    # ── Fase 6: artist_collection ────────────────────────────────────────────
+    # ── Fase artist_collection ───────────────────────────────────────────
 
     async def _phase_artist_collection(self, ctx: PipelineContext) -> None:
         song = ctx.song
@@ -713,74 +589,63 @@ class MetadataPipeline:
         itunes_artist_raw = ctx.itunes_result.data.get("artist", "") if ctx.itunes_result.found else ""
         self._finalize_artist_collection(song, accurate_artists, itunes_artist_raw, raw_title=song.raw.get("title", ""))
 
-    # ── Fase 7: Deezer fallback ──────────────────────────────────────────────
+    # ── Fase Deezer fallback ─────────────────────────────────────────────
 
     async def _phase_deezer_fallback(self, ctx: PipelineContext) -> None:
-        await self._step_deezer(
-            ctx.song, ctx.original_title, ctx.itunes_result.found,
-            ctx.mb_result.found or bool(ctx.deezer_isrc_result),
-        )
+        await self._step_deezer(ctx.song, ctx.original_title, ctx.itunes_result.found, ctx.mb_result.found or bool(ctx.deezer_isrc_result))
         self._finalize_compilation(ctx.song)
 
     async def _step_deezer(self, song: Song, original_title: str, itunes_found: bool, mb_found: bool) -> None:
         m = song.meta
         if not itunes_found and not mb_found:
             self.log.warning(f"[Pipeline][Deezer] Full fallback: '{original_title}'")
-            try:
-                raw = await self.deezer.get_full_metadata(title=original_title, artist=m.artist, album=m.album)
-                if raw:
-                    song.meta.apply(MetaMapper.from_deezer(raw, logger=self.log))
-            except Exception as exc:
-                self.log.debug(f"[Pipeline][Deezer] full_metadata: {exc}")
+            raw = await self._safe_call(self.deezer.get_full_metadata, "Deezer-full", title=original_title, artist=m.artist, album=m.album) or {}
+            if raw:
+                song.meta.apply(MetaMapper.from_deezer(raw, logger=self.log))
 
         if self.always_fallback_cover or "mzstatic.com/image" not in m.cover_url:
-            try:
-                url = await self.deezer.get_cover_url(title=m.title, artist=m.artist, album=m.album)
-                if url:
-                    m.cover_url = url
-            except Exception as exc:
-                self.log.debug(f"[Pipeline][Deezer] cover: {exc}")
+            url = await self._safe_call(self.deezer.get_cover_url, "Deezer-cover", title=m.title, artist=m.artist, album=m.album)
+            if url:
+                m.cover_url = url
 
-        partial: Dict[str, Any] = {}
-        needs_track_disc = m.track_number == 0 or m.disc_number == 0
-        needs_genre      = not m.genre
+        await self._deezer_fill_missing(song)
 
-        async def _fetch_track_disc():
-            if not needs_track_disc:
-                return
-            try:
-                dt, dd = await self.deezer.get_track_and_disc(title=m.title, artist=m.artist, album=m.album)
-                if dt > 0 and m.track_number == 0:
-                    partial["track_number"] = dt
-                if dd > 0 and m.disc_number == 0:
-                    partial["disc_number"] = dd
-            except Exception as exc:
-                self.log.debug(f"[Pipeline][Deezer] track/disc: {exc}")
-
-        async def _fetch_genre():
-            if not needs_genre:
-                return
-            try:
-                g = await self.deezer.get_genre(title=m.title, artist=m.artist)
-                if g:
-                    partial["genre"] = g
-            except Exception as exc:
-                self.log.debug(f"[Pipeline][Deezer] genre: {exc}")
-
-        if needs_track_disc or needs_genre:
-            await asyncio.gather(_fetch_track_disc(), _fetch_genre())
-
-        if partial:
-            song.meta.apply(partial)
         if not m.year:
             raw_year = song.raw.get("year", "")
             if raw_year:
                 m.year = str(raw_year)
 
-    # ── Apply helpers ─────────────────────────────────────────────────────────
+    async def _deezer_fill_missing(self, song: Song) -> None:
+        m = song.meta
+        partial: Dict[str, Any] = {}
+        needs_track_disc = m.track_number == 0 or m.disc_number == 0
+        needs_genre = not m.genre
+
+        async def _fetch_track_disc():
+            if not needs_track_disc:
+                return
+            dt, dd = await self._safe_call(self.deezer.get_track_and_disc, "Deezer-track/disc", title=m.title, artist=m.artist, album=m.album) or (0, 0)
+            if dt > 0 and m.track_number == 0:
+                partial["track_number"] = dt
+            if dd > 0 and m.disc_number == 0:
+                partial["disc_number"] = dd
+
+        async def _fetch_genre():
+            if not needs_genre:
+                return
+            g = await self._safe_call(self.deezer.get_genre, "Deezer-genre", title=m.title, artist=m.artist)
+            if g:
+                partial["genre"] = g
+
+        if needs_track_disc or needs_genre:
+            await asyncio.gather(_fetch_track_disc(), _fetch_genre())
+        if partial:
+            song.meta.apply(partial)
+
+    # ── Apply helpers ────────────────────────────────────────────────────
 
     def _apply_itunes(self, song, itunes, mb, mb_track_disc, original_title, original_duration) -> None:
-        overwrite   = self.guard.safe_overwrite_fields(itunes, mb, original_title, original_duration)
+        overwrite = self.guard.safe_overwrite_fields(itunes, mb, original_title, original_duration)
         itunes_data = dict(itunes.data)
         for key in ("track_number", "disc_number"):
             if mb_track_disc.get(key):
@@ -791,12 +656,8 @@ class MetadataPipeline:
         song.meta.apply(itunes_data, overwrite_keys=overwrite)
 
         if title_will_change:
-            # sort_title era già stato derivato dal vecchio titolo (seed) in
-            # SongProcessor._postprocess_meta; va rigenerato qui per restare
-            # coerente col titolo appena sovrascritto, altrimenti l'ordinamento
-            # in Apple Music/iTunes resta legato al titolo "povero" originale.
             song.meta.sort_title = Song.build_sort_name(song.meta.title)
-            self.log.debug(f"[Pipeline] title arricchito da iTunes: {song.meta.title!r} (sort_title aggiornato)")
+            self.log.debug(f"[Pipeline] title arricchito da iTunes: {song.meta.title!r}")
 
         self.log.info("[Pipeline] iTunes applicato.")
 
@@ -805,26 +666,23 @@ class MetadataPipeline:
             val = mb_track_disc.get(key)
             if val:
                 setattr(song.meta, key, val)
-                self.log.debug(f"[Pipeline] {key} forzato da MB = {val}")
+                self.log.debug(f"[Pipeline] {key} forzato = {val}")
 
     def _apply_mb_fallback(self, song: Song, mb: MBResult) -> None:
-        if not mb.found:
-            return
+        if not mb.found or not mb.recording.get("id") and "releases" not in mb.recording:
+            # MBResult sintetico da Deezer non ha struttura MB completa: skip.
+            if not mb.recording or "releases" not in mb.recording:
+                return
         song.meta.apply(MetaMapper.from_mb_recording(mb.recording, mb.album, logger=self.log))
-        detail     = mb.album or mb.recording
+        detail = mb.album or mb.recording
         song_title = TextCleaner.clean_text(song.meta.title, field_type="title")
         song_album = TextCleaner.clean_text(song.meta.album, field_type="album")
-        first_media, first_track, all_tracks = MusicBrainzHelper._resolve_media_and_track(
-            detail, song_title, song_album, self.log
-        )
+        first_media, first_track, all_tracks = MusicBrainzHelper._resolve_media_and_track(detail, song_title, song_album, self.log)
         song.meta.apply(MetaMapper.from_mb_track(first_media, first_track, all_tracks, logger=self.log))
         MusicBrainzHelper.apply_exclusive(song, mb.recording, logger=self.log)
         if not song.meta.album_artist and mb.album:
             credits = mb.album.get("artist-credit", [])
-            aa = "".join(
-                ac.get("name", "") + ac.get("joinphrase", "")
-                for ac in credits if isinstance(ac, dict)
-            ).strip()
+            aa = "".join(ac.get("name", "") + ac.get("joinphrase", "") for ac in credits if isinstance(ac, dict)).strip()
             if aa:
                 song.meta.album_artist = aa
         if not song.meta.label and mb.album:
@@ -834,39 +692,21 @@ class MetadataPipeline:
                 if label:
                     song.meta.label = label
 
-    # ── Resolve helpers ───────────────────────────────────────────────────────
+    # ── Resolve helpers ──────────────────────────────────────────────────
 
     def _resolve_mb_track_disc(self, song: Song, mb: MBResult) -> Dict[str, int]:
         if not mb.found or mb.confidence < MatchConfidence.GOOD:
             return {}
-
-        # FIX (refactoring): track_number/disc_number sono specifici della
-        # release MB risolta. Se il titolo cercato richiede un tag di
-        # versione (remix/live/ecc.) ma la recording MB trovata non lo ha
-        # nel titolo, MB ha quasi certamente risolto l'edizione sbagliata
-        # (visto concretamente: ISRC condiviso tra "Brothers" e "Brothers
-        # (feat. Lil Durk) [Remix]" — MB trova l'originale con confidence
-        # GOOD/HIGH ma la sua posizione-traccia appartiene a quell'edizione,
-        # non al remix). In quel caso non ci si può fidare della posizione:
-        # meglio lasciare il campo non forzato e lasciare che iTunes (più
-        # specifico sul tag versione, grazie al guard in VersionGuard)
-        # fornisca il valore corretto.
-        if mb.title_has_remix and not MusicPatterns.VERSION_TAG_RE.search(mb.mb_title or ""):
-            self.log.debug(
-                f"[Pipeline] MB track/disc NON forzati: recording MB "
-                f"{mb.mb_title!r} incoerente col tag di versione richiesto "
-                f"da '{song.meta.title}'"
-            )
+        if mb.title_has_remix and not self._has_version_tag(mb.mb_title or ""):
+            self.log.debug(f"[Pipeline] track/disc NON forzati: recording incoerente col tag versione.")
             return {}
 
         detail = mb.album or mb.recording
-        if not detail:
+        if not detail or "media" not in detail and "releases" not in detail:
             return {}
         first_media, first_track, all_tracks = MusicBrainzHelper._resolve_media_and_track(
-            detail,
-            TextCleaner.clean_text(song.meta.title, field_type="title"),
-            TextCleaner.clean_text(song.meta.album, field_type="album"),
-            self.log,
+            detail, TextCleaner.clean_text(song.meta.title, field_type="title"),
+            TextCleaner.clean_text(song.meta.album, field_type="album"), self.log,
         )
         if not first_track:
             return {}
@@ -888,15 +728,11 @@ class MetadataPipeline:
 
     def _resolve_search_album(self, song: Song, mb: MBResult) -> str:
         original = song.meta.album
-        if mb.mb_album_title and MusicPatterns.DELUXE_TAG_RE.search(original):
+        if mb.mb_album_title and self._DELUXE_TAG_RE.search(original):
             return original
         return mb.mb_album_title or original
 
-    async def _resolve_accurate_artists(
-        self, song: Song, sp_mapped: dict,
-        deezer_isrc_result: Optional[Dict[str, Any]] = None,
-        original_title: str = "",
-    ) -> str:
+    async def _resolve_accurate_artists(self, song: Song, sp_mapped: dict, deezer_isrc_result: Optional[Dict[str, Any]] = None, original_title: str = "") -> str:
         sp_artists = (sp_mapped or {}).get("artist_collection", "")
         if sp_artists:
             return sp_artists
@@ -910,42 +746,26 @@ class MetadataPipeline:
     async def _resolve_mb_artists(self, song: Song, original_title: str = "") -> str:
         if not song.meta.isrc:
             return ""
-        try:
-            artists, _ = await self.mb.get_accurate_artists_by_isrc(
-                song.meta.isrc, original_title=original_title or song.meta.title,
-            )
-            return artists
-        except Exception as exc:
-            self.log.debug(f"[Pipeline] resolve_mb_artists: {exc}")
-            return ""
+        artists, _ = await self._safe_call(
+            self.mb.get_accurate_artists_by_isrc, "MB-artists",
+            song.meta.isrc, original_title=original_title or song.meta.title,
+        ) or ("", "")
+        return artists
 
     async def _apply_mb_country(self, recording: Dict) -> None:
         artist = next(
-            (
-                ac.get("artist", {}).get("name", "") or ac.get("name", "")
-                for ac in recording.get("artist-credit", [])
-                if isinstance(ac, dict)
-            ),
+            (ac.get("artist", {}).get("name", "") or ac.get("name", "") for ac in recording.get("artist-credit", []) if isinstance(ac, dict)),
             "",
         )
         if not artist:
             return
-        try:
-            country = await self.mb._resolve_artist_country(artist)
-            target  = country.upper() if country and country.upper() in MusicPatterns.ITUNES_VALID_COUNTRIES else "US"
-            self.itunes.set_country_for_artist(target)
-            if target == "US":
-                self.log.debug(f"[Pipeline] country '{country}' non valida, uso US")
-        except Exception as exc:
-            self.log.debug(f"[Pipeline] country resolve: {exc}")
-            self.itunes.set_country_for_artist("US")
+        country = await self._safe_call(self.mb._resolve_artist_country, "MB-country", artist)
+        target = country.upper() if country and country.upper() in MusicPatterns.ITUNES_VALID_COUNTRIES else "US"
+        self.itunes.set_country_for_artist(target)
 
-    # ── Finalizzazione ────────────────────────────────────────────────────────
+    # ── Finalizzazione ───────────────────────────────────────────────────
 
-    def _finalize_artist_collection(
-        self, song: Song, accurate_artists: str,
-        itunes_artist_raw: str = "", raw_title: str = "",
-    ) -> None:
+    def _finalize_artist_collection(self, song: Song, accurate_artists: str, itunes_artist_raw: str = "", raw_title: str = "") -> None:
         m = song.meta
         if accurate_artists:
             m.artist_collection = MusicPatterns.normalize_artist_list(accurate_artists)
@@ -968,13 +788,13 @@ class MetadataPipeline:
             m.artist_collection = m.artist
 
     def _finalize_compilation(self, song: Song) -> None:
-        m       = song.meta
+        m = song.meta
         norm_aa = TextCleaner.normalize(m.album_artist)
         norm_pa = TextCleaner.normalize(m.artist_collection or m.artist)
         is_various = norm_aa in MusicPatterns.VARIOUS_ARTISTS
         m.compilation = is_various or bool(norm_pa and norm_aa and norm_pa != norm_aa)
 
-    # ── Anno ──────────────────────────────────────────────────────────────────
+    # ── Anno ─────────────────────────────────────────────────────────────
 
     async def _fix_bad_year(self, song: Song, mb: MBResult) -> None:
         year = str(song.meta.year).strip()
@@ -988,66 +808,52 @@ class MetadataPipeline:
                     mb_year = int(date_src[:4])
                     current = int(year) if (year and year.isdigit()) else 9999
                     if 1900 <= mb_year <= 2100 and mb_year < current:
-                        self.log.info(f"[Pipeline] Anno: {mb_year} (era {current})")
                         song.meta.year = str(mb_year)
                         return
                     if 1900 <= mb_year <= 2100 and not (year and year.isdigit()):
                         song.meta.year = str(mb_year)
                         return
+
         if not year or not year.isdigit() or not (1900 <= int(year) <= 2100):
-            self.log.warning(f"[Pipeline] Anno errato ({year!r}), recupero da MB")
             song.meta.year = ""
-            if not mb.found or not mb.recording:
-                return
-            rec_id = mb.recording.get("id")
+            rec_id = (mb.recording or {}).get("id") if mb.found else None
             if not rec_id:
                 return
-            try:
-                rec = await self.mb.fetch_recording_by_id(rec_id, inc_params="releases+release-groups")
-                if not rec:
-                    return
-                for date_src in (
-                    rec.get("first-release-date", ""),
-                    (rec.get("release-groups") or [{}])[0].get("first-release-date", ""),
-                    (rec.get("releases") or [{}])[0].get("date", ""),
-                ):
-                    if date_src and len(date_src) >= 4 and date_src[:4].isdigit():
-                        y = int(date_src[:4])
-                        if 1900 <= y <= 2100:
-                            song.meta.year = str(y)
-                            self.log.info(f"[Pipeline] Anno corretto: {y}")
-                            return
-            except Exception as exc:
-                self.log.debug(f"[Pipeline] fix_bad_year: {exc}")
+            rec = await self._safe_call(self.mb.fetch_recording_by_id, "MB-year", rec_id, inc_params="releases+release-groups")
+            if not rec:
+                return
+            for date_src in (
+                rec.get("first-release-date", ""),
+                (rec.get("release-groups") or [{}])[0].get("first-release-date", ""),
+                (rec.get("releases") or [{}])[0].get("date", ""),
+            ):
+                if date_src and len(date_src) >= 4 and date_src[:4].isdigit():
+                    y = int(date_src[:4])
+                    if 1900 <= y <= 2100:
+                        song.meta.year = str(y)
+                        return
 
-    # ── Score helpers ─────────────────────────────────────────────────────────
+    # ── Score helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _mb_confidence(
-        score, final_isrc, isrc_hint, duration_ms, cand_ms, isrc_fetch_trusted: bool = True,
-    ) -> MatchConfidence:
-        """
-        FIX (refactoring): ISRC_EXACT veniva assegnato ogni volta che
-        final_isrc == isrc_hint come stringhe, indipendentemente da come il
-        candidato era stato trovato. Questo permetteva a un ISRC fornito a
-        monte (yt-dlp/YouTube Music) ma incoerente con la versione richiesta
-        — es. ISRC dell'originale "Brothers" passato per il video
-        "Brothers (Remix)" — di propagarsi come "match certo" anche quando
-        il fetch diretto per quell'ISRC era già stato scartato per
-        incoerenza di titolo, e il risultato finale arrivava invece dalla
-        ricerca testuale. `isrc_fetch_trusted` (default True per i chiamanti
-        che non lo passano esplicitamente, retrocompatibile) deve essere
-        False in quel caso, impedendo una ISRC_EXACT "fortuita" e facendo
-        ricadere la confidence sullo score testuale reale.
-        """
+    def _confidence_from_score(score: float, is_isrc_exact: bool = False) -> MatchConfidence:
+        if is_isrc_exact:
+            return MatchConfidence.ISRC_EXACT
+        if score >= 0.90:
+            return MatchConfidence.HIGH
+        if score >= 0.70:
+            return MatchConfidence.GOOD
+        if score >= 0.55:
+            return MatchConfidence.LOW
+        return MatchConfidence.NONE
+
+    @staticmethod
+    def _mb_confidence(score, final_isrc, isrc_hint, duration_ms, cand_ms, isrc_fetch_trusted: bool = True) -> MatchConfidence:
         if isrc_fetch_trusted and final_isrc and isrc_hint and final_isrc.upper() == isrc_hint.upper():
             return MatchConfidence.ISRC_EXACT
         if score >= 0.90:
             return MatchConfidence.HIGH
-        duration_ok = (
-            abs(duration_ms - cand_ms) <= MusicPatterns.DURATION_TOLERANCE_MS
-            if duration_ms and cand_ms else True
-        )
+        duration_ok = abs(duration_ms - cand_ms) <= MusicPatterns.DURATION_TOLERANCE_MS if duration_ms and cand_ms else True
         if score >= 0.70 and duration_ok:
             return MatchConfidence.GOOD
         if score >= 0.55:
@@ -1065,30 +871,26 @@ class MetadataPipeline:
             TextCleaner.clean_text(raw.get("artist", ""), field_type="artist"),
         )
         c = 0.6 * t + 0.4 * a
-        if c >= 0.90: return MatchConfidence.HIGH
-        if c >= 0.75: return MatchConfidence.GOOD
-        if c >= 0.55: return MatchConfidence.LOW
+        if c >= 0.90:
+            return MatchConfidence.HIGH
+        if c >= 0.75:
+            return MatchConfidence.GOOD
+        if c >= 0.55:
+            return MatchConfidence.LOW
         return MatchConfidence.NONE
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    @classmethod
+    def _has_version_tag(cls, text: str) -> bool:
+        return bool(cls._VERSION_TAG_RE.search(text or ""))
 
-    async def aclose(self) -> None:
-        for provider in (self.mb, self.itunes, self.deezer):
-            if hasattr(provider, "close"):
-                try:
-                    await provider.close()
-                except Exception:
-                    pass
+    # ── DB candidate search ──────────────────────────────────────────────
 
-    # Pipeline/MetadataPipeline.py — import in cima al file
     @staticmethod
     def _key_word(norm: str) -> str:
         words = [w for w in norm.split() if w not in TextCleaner._STOPWORDS]
         return max(words, key=len) if words else (norm.split()[0] if norm else "")
 
     async def _db_candidate_rows(self, title_norm: str, artist_norm: str) -> list[AppleMusicTrack]:
-        """Pre-filtro SQL (word LIKE) invece di limit(200) arbitrario, che scartava
-        ogni riga oltre le prime 200 senza alcun criterio."""
         conds = []
         if artist_norm:
             conds.append(AppleMusicTrack.artist_name.ilike(f"%{self._key_word(artist_norm)}%"))
@@ -1100,32 +902,19 @@ class MetadataPipeline:
         result = await self.db_session.execute(stmt)
         return list(result.scalars().all())
 
-
-    async def _db_track_by_title_artist(
-        self, title_norm: str, artist_norm: str, album_hint: str = "",
-        duration_ms: Optional[int] = None,
-    ) -> Optional[AppleMusicTrack]:
-        try:
-            rows = await self._db_candidate_rows(title_norm, artist_norm)
-        except Exception as exc:
-            self.log.debug(f"[Pipeline][DB] select tracks fallito: {exc}")
-            return None
+    async def _db_track_by_title_artist(self, title_norm: str, artist_norm: str, album_hint: str = "", duration_ms: Optional[int] = None) -> Optional[AppleMusicTrack]:
+        rows = await self._safe_call(self._db_candidate_rows, "DB-candidates", title_norm, artist_norm) or []
         if not rows:
             return None
 
         album_norm = TextCleaner.normalize(album_hint) if album_hint else ""
-        hint_edition = (
-            ReleaseEdition.from_collection(collection_name=album_hint, title_norm=title_norm)
-            if album_hint else None
-        )
-        best_track, best_score, best_combined = None, -1.0, -1.0
+        hint_edition = ReleaseEdition.from_collection(collection_name=album_hint, title_norm=title_norm) if album_hint else None
+        best_track, best_combined = None, -1.0
 
         for row in rows:
             candidate = {
-                "trackName": row.track_name or "",
-                "artistName": row.artist_name or "",
-                "collectionName": row.collection_name or "",
-                "trackTimeMillis": row.track_time_millis,
+                "trackName": row.track_name or "", "artistName": row.artist_name or "",
+                "collectionName": row.collection_name or "", "trackTimeMillis": row.track_time_millis,
             }
             score = self.matcher.score_candidate(
                 title=title_norm, artist=artist_norm, album_hint=album_norm,
@@ -1134,31 +923,46 @@ class MetadataPipeline:
             if score is None:
                 continue
 
-            # NUOVO: tie-break su ReleaseEdition, stesso schema di _db_track_by_isrc
             edition_bonus = 0.0
             album = row.album
             if album:
                 edition = ReleaseEdition.from_collection(
-                    collection_type=album.collection_type or "",
-                    collection_name=album.collection_name or "",
-                    track_count=album.track_count or 0,
-                    title_norm=title_norm,
+                    collection_type=album.collection_type or "", collection_name=album.collection_name or "",
+                    track_count=album.track_count or 0, title_norm=title_norm,
                 )
-                if hint_edition and edition:
-                    if hint_edition.compatible_with(edition):
-                        edition_bonus = min((album.track_count or 1) / 20.0, 0.3)
-                    else:
-                        edition_bonus = -0.5
-                elif edition and not edition.is_short_form:
+                if hint_edition:
+                    edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
+                elif not edition.is_short_form:
                     edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
 
             combined = score + edition_bonus
             if combined > best_combined:
-                best_combined, best_score, best_track = combined, score, row
+                best_combined, best_track = combined, row
 
-        if best_track:
-            self.log.debug(
-                f"[Pipeline][DB] Hit: '{best_track.track_name}' "
-                f"score={best_score:.2f} combined={best_combined:.2f}"
-            )
         return best_track
+
+    async def _db_track_to_meta(self, track: AppleMusicTrack) -> Dict[str, Any]:
+        from Providers.ItunesProvider import ITunesProvider as _IP
+        raw = _IP._track_model_to_dict(track)
+        mapped = MetaMapper.from_itunes(item=raw, default_title=track.track_name or "", default_artist=track.artist_name or "", logger=self.log)
+        mapped["_from_db"] = True
+        return mapped
+
+    # ── Utility: chiamata provider con try/except centralizzato ──────────
+
+    async def _safe_call(self, fn, label: str, *args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as exc:
+            self.log.debug(f"[Pipeline][{label}] {exc}")
+            return None
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    async def aclose(self) -> None:
+        for provider in (self.mb, self.itunes, self.deezer):
+            if hasattr(provider, "close"):
+                try:
+                    await provider.close()
+                except Exception:
+                    pass

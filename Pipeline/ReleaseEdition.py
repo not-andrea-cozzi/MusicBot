@@ -120,6 +120,22 @@ class ReleaseEdition:
 
     def describe(self) -> str:
         return f"{self.kind.value}(tracks={self.track_count}, editions={sorted(self.edition_tokens)})"
+    
+    @classmethod
+    def from_deezer_kind(cls, kind: str, track_count: int = 0, title_norm: str = "") -> "ReleaseEdition":
+        """Costruisce ReleaseEdition da DeezerProvider.search_recording()['_release_edition_kind']."""
+        mapping = {
+            "single": ReleaseKind.SINGLE,
+            "ep": ReleaseKind.EP,
+            "album": ReleaseKind.ALBUM,
+            "compilation": ReleaseKind.COMPILATION,
+        }
+        return cls(
+            kind=mapping.get(kind, ReleaseKind.UNKNOWN),
+            track_count=track_count or 0,
+            edition_tokens=frozenset(),
+            album_title_norm=title_norm,
+        )
 
 
 def isrc_match_is_safe(
@@ -141,3 +157,5 @@ def isrc_match_is_safe(
     if edition_a is None or edition_b is None:
         return True
     return edition_a.compatible_with(edition_b)
+
+    
