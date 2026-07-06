@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from typing import Any, Dict, Optional, Tuple
-
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from Algorithm.TextCleaner import TextCleaner
@@ -556,72 +556,7 @@ class MetadataPipeline:
 
         return max(rows, key=_score)
 
-    async def _db_track_by_title_artist(
-        self, title_norm: str, artist_norm: str
-    ) -> Optional[AppleMusicTrack]:
-        try:
-            stmt        = select(AppleMusicTrack).limit(200)
-            rows_result = await self.db_session.execute(stmt)
-            rows: list[AppleMusicTrack] = list(rows_result.scalars().all())
-        except Exception as exc:
-            self.log.debug(f"[Pipeline][DB] select tracks fallito: {exc}")
-            return None
-
-        best_track: Optional[AppleMusicTrack] = None
-        best_score = 0.0
-
-        for row in rows:
-            t_norm = TextCleaner.normalize(row.track_name or "")
-            a_norm = TextCleaner.normalize(row.artist_name or "")
-
-            t_sim = TextCleaner.title_similarity(title_norm, t_norm)
-            if t_sim < 0.88:
-                continue
-
-            a_sim = TextCleaner.title_similarity(artist_norm, a_norm) if artist_norm else 1.0
-            if a_sim < 0.70:
-                continue
-
-            combined = 0.6 * t_sim + 0.4 * a_sim
-            if combined > best_score:
-                best_score = combined
-                best_track = row
-
-        if best_track:
-            self.log.debug(f"[Pipeline][DB] Hit: '{best_track.track_name}' score={best_score:.2f}")
-        return best_track
-
-    async def _db_track_to_meta(self, track: AppleMusicTrack) -> Dict[str, Any]:
-        meta: Dict[str, Any] = {
-            "title":                track.track_name or "",
-            "artist":               track.artist_name or "",
-            "album":                track.collection_name or "",
-            "track_number":         track.track_number or 0,
-            "disc_number":          track.disc_number or 0,
-            "explicit":             (track.track_explicitness or "").lower() == "explicit",
-            "genre":                track.primary_genre_name or "",
-            "itunes_track_id":      str(track.track_id) if track.track_id else "",
-            "itunes_artist_id":     str(track.artist_id) if track.artist_id else "",
-            "itunes_collection_id": str(track.collection_id) if track.collection_id else "",
-        }
-
-        if track.artwork_url:
-            meta["cover_url"] = re.sub(r"\d+x\d+bb", "3000x3000bb", track.artwork_url)
-
-        if track.collection_id and self.db_session:
-            try:
-                album = await AlbumService.get(self.db_session, track.collection_id)
-                if album:
-                    meta["album_artist"] = album.artist_name or track.artist_name or ""
-                    if album.release_date:
-                        meta["year"] = str(album.release_date.year)
-                    if not meta["genre"] and album.primary_genre_name:
-                        meta["genre"] = album.primary_genre_name
-            except Exception as exc:
-                self.log.debug(f"[Pipeline][DB] album join fallito: {exc}")
-
-        return {k: v for k, v in meta.items() if v not in (None, "", 0, False)}
-
+   
     def _finalize_from_db(self, ctx: PipelineContext) -> Song:
         """
         Applica il DB-hit e chiude la pipeline. Nessuna chiamata a provider
@@ -1179,7 +1114,11 @@ class MetadataPipeline:
             return None
 
         album_norm = TextCleaner.normalize(album_hint) if album_hint else ""
-        best_track, best_score = None, -1.0
+        hint_edition = (
+            ReleaseEdition.from_collection(collection_name=album_hint, title_norm=title_norm)
+            if album_hint else None
+        )
+        best_track, best_score, best_combined = None, -1.0, -1.0
 
         for row in rows:
             candidate = {
@@ -1192,9 +1131,34 @@ class MetadataPipeline:
                 title=title_norm, artist=artist_norm, album_hint=album_norm,
                 duration_ms=duration_ms, isrc="", candidate=candidate,
             )
-            if score is not None and score > best_score:
-                best_score, best_track = score, row
+            if score is None:
+                continue
+
+            # NUOVO: tie-break su ReleaseEdition, stesso schema di _db_track_by_isrc
+            edition_bonus = 0.0
+            album = row.album
+            if album:
+                edition = ReleaseEdition.from_collection(
+                    collection_type=album.collection_type or "",
+                    collection_name=album.collection_name or "",
+                    track_count=album.track_count or 0,
+                    title_norm=title_norm,
+                )
+                if hint_edition and edition:
+                    if hint_edition.compatible_with(edition):
+                        edition_bonus = min((album.track_count or 1) / 20.0, 0.3)
+                    else:
+                        edition_bonus = -0.5
+                elif edition and not edition.is_short_form:
+                    edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
+
+            combined = score + edition_bonus
+            if combined > best_combined:
+                best_combined, best_score, best_track = combined, score, row
 
         if best_track:
-            self.log.debug(f"[Pipeline][DB] Hit: '{best_track.track_name}' score={best_score:.2f}")
+            self.log.debug(
+                f"[Pipeline][DB] Hit: '{best_track.track_name}' "
+                f"score={best_score:.2f} combined={best_combined:.2f}"
+            )
         return best_track
