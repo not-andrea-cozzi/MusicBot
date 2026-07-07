@@ -13,7 +13,7 @@ from Helpers.MetaMapper import MetaMapper
 from Model.Song import Song
 from Pipeline.PipelineContext import PipelineContext
 from Pipeline.PipelineResult import ITunesResult, MBResult, MatchConfidence
-from Pipeline.ReleaseEdition import ReleaseEdition, isrc_match_is_safe
+from Pipeline.ReleaseEdition import ReleaseEdition, ReleaseKind, isrc_match_is_safe
 from Pipeline.VersionGuard import VersionGuard
 from Providers.DeezerProvider import DeezerProvider
 from Providers.ItunesProvider import ITunesProvider
@@ -473,8 +473,11 @@ class MetadataPipeline:
             edition_bonus = 0.0
             if hint_edition and edition:
                 edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
-            elif edition and not edition.is_short_form:
-                edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
+            elif edition:
+                if edition.kind is ReleaseKind.COMPILATION:
+                    edition_bonus = -0.5
+                elif not edition.is_short_form:
+                    edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
             return album_sim + edition_bonus
 
         return max(rows, key=_score)
@@ -924,16 +927,19 @@ class MetadataPipeline:
                 continue
 
             edition_bonus = 0.0
-            album = row.album
-            if album:
-                edition = ReleaseEdition.from_collection(
-                    collection_type=album.collection_type or "", collection_name=album.collection_name or "",
-                    track_count=album.track_count or 0, title_norm=title_norm,
-                )
-                if hint_edition:
-                    edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
-                elif not edition.is_short_form:
-                    edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
+            if row.collection_id:
+                album = await AlbumService.get(self.db_session, row.collection_id)
+                if album:
+                    edition = ReleaseEdition.from_collection(
+                        collection_type=album.collection_type or "", collection_name=album.collection_name or "",
+                        track_count=album.track_count or 0, title_norm=title_norm,
+                    )
+                    if hint_edition:
+                        edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
+                    elif edition.kind is ReleaseKind.COMPILATION:
+                        edition_bonus = -0.5
+                    elif not edition.is_short_form:
+                        edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
 
             combined = score + edition_bonus
             if combined > best_combined:
@@ -952,7 +958,9 @@ class MetadataPipeline:
 
     async def _safe_call(self, fn, label: str, *args, **kwargs):
         try:
-            return await fn(*args, **kwargs)
+            if asyncio.iscoroutinefunction(fn):
+                return await fn(*args, **kwargs)
+            return await asyncio.to_thread(fn, *args, **kwargs)
         except Exception as exc:
             self.log.debug(f"[Pipeline][{label}] {exc}")
             return None

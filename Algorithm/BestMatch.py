@@ -40,6 +40,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "track_id":         10.0,
     "live_mismatch":     3.0,
     "remix_mismatch":    3.0,
+    "compilation_penalty": 2.0,
 }
 
 _TITLE_HARD_REJECT: float = 0.35
@@ -241,6 +242,10 @@ def _is_single_or_ep(candidate: dict) -> bool:
     return ct in ("Single", "EP") or bool(_SINGLE_EP_SUFFIX_RE.search(album))
 
 
+def _is_compilation(candidate: dict) -> bool:
+    return candidate.get("collectionType", "") == "Compilation"
+
+
 def _primary_artist_contained(primary: str, candidate_artist: str) -> bool:
     if not primary or not candidate_artist:
         return False
@@ -421,6 +426,9 @@ class TrackMatcher:
             cand_ed = _edition_tokens(cand_album)
             if cand_ed:
                 dist.add("album_edition", 2.0)
+
+        if _is_compilation(candidate):
+            dist.add("compilation_penalty", 1.0)
 
         return dist
 
