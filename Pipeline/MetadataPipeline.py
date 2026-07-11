@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import and_, select, or_
 
 from Algorithm.TextCleaner import TextCleaner
 from Helpers.MusicBrainzHelper import MusicBrainzHelper
@@ -901,7 +901,8 @@ class MetadataPipeline:
             conds.append(AppleMusicTrack.track_name.ilike(f"%{self._key_word(title_norm)}%"))
         if not conds:
             return []
-        stmt = select(AppleMusicTrack).where(or_(*conds)).limit(3000)
+        where = and_(*conds) if len(conds) > 1 else conds[0]
+        stmt = select(AppleMusicTrack).where(where).limit(3000)
         result = await self.db_session.execute(stmt)
         return list(result.scalars().all())
 
