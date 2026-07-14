@@ -10,7 +10,30 @@ from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 from Model.SongMeta import SongMeta
 
 
+STOREFRONT_IDS = {
+        "US": 143441, "GB": 143444, "CA": 143455, "AU": 143460,
+        "IT": 143450, "FR": 143442, "DE": 143443, "ES": 143454,
+        "PT": 143453, "NL": 143452, "BE": 143446, "CH": 143459,
+        "AT": 143445, "SE": 143456, "NO": 143457, "DK": 143458,
+        "FI": 143447, "PL": 143478, "RU": 143469, "GR": 143448,
+        "TR": 143480, "IE": 143449, "JP": 143462, "KR": 143466,
+        "CN": 143465, "TW": 143470, "HK": 143463, "IN": 143467,
+        "ID": 143476, "PH": 143474, "MY": 143473, "SG": 143464,
+        "TH": 143475, "VN": 143471, "ZA": 143472, "MX": 143468,
+        "BR": 143503, "AR": 143505, "CL": 143483, "CO": 143501,
+        "AE": 143481, "SA": 143479, "IL": 143491, "NZ": 143461,
+        "RO": 143487, "HU": 143482, "CZ": 143489, "SK": 143496,
+        "BG": 143526, "HR": 143494, "SI": 143499,
+    }
+
+def get_store_code(country_code: str, default: int = 143441) -> int:
+        return STOREFRONT_IDS.get((country_code or "").upper(), default)
+
 class SongMetaWriter:
+
+
+    # Utils/StorefrontMap.py
+
 
     log = logging.getLogger(__name__)
 
@@ -38,7 +61,7 @@ class SongMetaWriter:
 
         text_atoms = (
             ("\xa9nam", "title"),
-            ("\xa9ART", "artist_collection"),
+            ("\xa9ART", "artist"),
             ("aART",    "album_artist"),
             ("\xa9alb", "album"),
             ("\xa9gen", "genre"),
@@ -117,6 +140,31 @@ class SongMetaWriter:
             v = getattr(m, key, "")
             if v:
                 tags[f"----:com.apple.iTunes:{atom}"] = cls._freeform(v)
+
+        apple_internal = (
+            ("itunes_collection_id", "plID"),  # playlist/album id
+            ("itunes_collection_id", "cnID"),  # collection id
+            ("itunes_artist_id",     "atID"),  # artist id
+            ("genre_id",             "geID"),  # se non hai genre_id, ometti questa riga
+        )
+        for key, atom in apple_internal:
+            v = getattr(m, key, "")
+            if v and str(v).isdigit():
+                tags[atom] = [int(v)]
+
+        # Storefront (US=143441, IT=143450, ecc — mappa da country se disponibile)
+        if getattr(m, "storefront_id", None):
+            tags["sfID"] = [int(m.storefront_id)]
+
+        # Encoder tag: fa sembrare il file "acquistato" da iTunes agli occhi di Music.app
+        tags["\xa9too"] = ["iTunes 12.12.0.1"]
+
+        # cmID (compilation match id) / xID (external id) — opzionali, solo se hai itunes_track_id
+        if m.itunes_track_id and str(m.itunes_track_id).isdigit():
+            tags["cmID"] = [int(m.itunes_track_id)]
+        
+        else:
+            tags["sfID"] = [get_store_code(m.country)]
 
         return tags
 
