@@ -19,7 +19,7 @@ from Pipeline.VersionGuard import VersionGuard
 from Providers.DeezerProvider import DeezerProvider
 from Providers.ItunesProvider import ITunesProvider
 from Providers.MusicBrainzApi import MusicBrainzApiRequstor
-from Algorithm.BestMatch import TrackMatcher
+from Algorithm.BestMatch import TrackMatcher, strip_parenthetical
 from Providers.SpotifyProvider import SpotifyProvider
 from Utils.MusicPatterns import MusicPatterns
 from Database.Model.ItunesModel import AppleMusicAlbum, AppleMusicTrack
@@ -185,7 +185,11 @@ class MetadataPipeline:
         )
 
         ctx.mb_result = MBResult(
-            recording={"title": raw.get("title", ""), "isrcs": [found_isrc] if found_isrc else []},
+               recording={
+                    "title": raw.get("title", ""),
+                    "isrcs": [found_isrc] if found_isrc else [],
+                    "artist_cleaned": TextCleaner.clean_text(raw.get("artist", ""), field_type="artist"),
+                },
             album={"title": raw["album"]} if raw.get("album") else None,
             track_score=score,
             confidence=confidence,
@@ -387,11 +391,34 @@ class MetadataPipeline:
         self.log.info("[Pipeline][DB] Hit locale → read-only, salto Deezer + iTunes.")
         return True
 
-    async def _lookup_local_db(self, song: Song, isrc: str) -> Dict[str, Any]:  
+    async def _lookup_local_db(self, song: Song, isrc: str) -> Dict[str, Any]:
         title_has_remix = self._has_version_tag(song.meta.title)
         album_hint = song.meta.album
         title_norm = TextCleaner.normalize(song.meta.title)
         artist_norm = TextCleaner.normalize(TextCleaner.primary_artist(song.meta.artist))
+
+        # ── NUOVO: priorità a titolo+artista+album (quello che YT Music già
+        # fornisce), invece di fidarsi ciecamente dell'ISRC per selezionare
+        # la riga DB. Un ISRC può pescare una riga persistita sotto un
+        # collectionId sbagliato da un run precedente (es. una compilation
+        # "Various Artists" salvata per errore); title+artist+album è un
+        # segnale più diretto e meno soggetto a inquinamento storico del DB.
+        if title_norm and album_hint:
+            title_track = await self._db_track_by_title_artist(
+                title_norm, artist_norm, album_hint, song.meta.duration_ms
+            )
+            if title_track and self._db_track_matches_version(title_track, title_has_remix):
+                if await self._db_track_edition_compatible(title_track, album_hint, song.meta.title):
+                    self.log.debug(
+                        f"[Pipeline][DB] Match title+artist+album: "
+                        f"'{title_track.track_name}' (collection_id={title_track.collection_id})"
+                    )
+                    return await self._db_track_to_meta(title_track)
+                else:
+                    self.log.debug(
+                        f"[Pipeline][DB] Match title+artist+album trovato ma edition "
+                        f"incompatibile con hint album {album_hint!r}, provo altre strade."
+                    )
 
         isrc_track: Optional[AppleMusicTrack] = None
 
@@ -417,15 +444,9 @@ class MetadataPipeline:
                 title_ok = await self._db_track_edition_compatible(title_track, album_hint, song.meta.title)
                 if title_ok:
                     return await self._db_track_to_meta(title_track)
+            elif title_track and not album_hint:
+                return await self._db_track_to_meta(title_track)
 
-        # NUOVO: se l'ISRC-hit era edition-incompatibile (Single vs hint Album)
-        # e non abbiamo trovato un'alternativa migliore per titolo/artista,
-        # NON accettare comunque isrc_track: significherebbe scrivere
-        # track_number/disc_number della release SBAGLIATA (es. sempre 1,
-        # dalla riga -Single) solo perché l'album vero non è ancora stato
-        # persistito in DB da un'altra song processata in parallelo. Meglio
-        # forzare il fallback a iTunes live, che risolve l'album correttamente
-        # via _strategy_album_hint indipendentemente dallo stato del DB.
         if isrc_track and not isrc_edition_ok:
             self.log.debug(
                 f"[Pipeline][DB] ISRC {isrc!r} → solo release edition-incompatibile "
@@ -439,20 +460,7 @@ class MetadataPipeline:
 
         return {}
 
-    async def _db_track_edition_compatible(self, track: AppleMusicTrack, album_hint: str, title_hint: str) -> bool:
-        """
-        True se non c'è hint album, o se la forma dell'album trovato in DB
-        (single/EP vs album) è compatibile con quella suggerita da album_hint.
-
-        NOTA: NON usa ReleaseEdition.from_collection(collection_name=album_hint)
-        "as-is" per l'hint, perché senza collection_type/track_count quella
-        chiamata classifica quasi sempre come UNKNOWN — e compatible_with()
-        tratta UNKNOWN come sempre compatibile, vanificando il controllo (bug
-        osservato: hint 'WUNNA' -> UNKNOWN -> compatibile con qualsiasi Single).
-        Qui l'hint è invece classificato esplicitamente: se il testo NON porta
-        un suffisso -Single/-EP, lo trattiamo come long-form (Album), a meno
-        che l'hint stesso non coincida col titolo del brano (self-titled single).
-        """
+    async def _db_track_edition_compatible(self, track, album_hint, title_hint) -> bool:
         if not album_hint or not track.collection_id:
             return True
 
@@ -460,28 +468,25 @@ class MetadataPipeline:
         if not album:
             return True
 
-        title_norm = TextCleaner.normalize(title_hint) if title_hint else ""
-        found_edition = ReleaseEdition.from_collection(
-            collection_type=album.collection_type or "",
-            collection_name=album.collection_name or "",
-            track_count=album.track_count or 0,
-            title_norm=title_norm,
-        )
-
-        hint_norm = TextCleaner.normalize(album_hint)
-        hint_is_short_form = bool(FakeAlbumSuffix.has(hint_norm)) or (
-            bool(title_norm) and hint_norm == title_norm
-        )
-
-        if hint_is_short_form:
-            return True  # hint stesso ambiguo/self-titled: non contraddice nulla
-
-        # Hint è chiaramente un nome di album "pieno" (non -Single/-EP, non
-        # self-titled): un match trovato che è Single/EP con pochi/nessun
-        # riscontro di tracklist ampia è incompatibile.
-        if found_edition.is_short_form and found_edition.track_count <= 3:
+        if TextCleaner.normalize(album.artist_name or "") == "various artists":
             return False
 
+        title_norm = TextCleaner.normalize(title_hint) if title_hint else ""
+        title_core_norm = TextCleaner.normalize(strip_parenthetical(title_hint)) if title_hint else ""
+        hint_norm = TextCleaner.normalize(album_hint)
+
+        hint_is_short_form = bool(FakeAlbumSuffix.has(hint_norm)) or (
+            bool(hint_norm) and hint_norm in (title_norm, title_core_norm)
+        )
+        if hint_is_short_form:
+            return True
+
+        found_edition = ReleaseEdition.from_collection(
+            collection_type=album.collection_type or "", collection_name=album.collection_name or "",
+            track_count=album.track_count or 0, title_norm=title_norm,
+        )
+        if found_edition.is_short_form and found_edition.track_count <= 3:
+            return False
         return True
 
     @staticmethod
@@ -868,9 +873,9 @@ class MetadataPipeline:
     def _finalize_compilation(self, song: Song) -> None:
         m = song.meta
         norm_aa = TextCleaner.normalize(m.album_artist)
-        norm_pa = TextCleaner.normalize(m.artist_collection or m.artist)
+        norm_primary = TextCleaner.normalize(TextCleaner.primary_artist(m.artist))
         is_various = norm_aa in MusicPatterns.VARIOUS_ARTISTS
-        m.compilation = is_various or bool(norm_pa and norm_aa and norm_pa != norm_aa)
+        m.compilation = is_various or bool(norm_primary and norm_aa and norm_primary != norm_aa)
 
     # ── Anno ─────────────────────────────────────────────────────────────
 

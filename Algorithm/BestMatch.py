@@ -27,7 +27,7 @@ _SD_REPLACE: tuple[tuple[str, str], ...] = (
     (r"\s*'\s*",  "'"),
 )
 
-_PREFER_SINGLE: bool = False
+_PREFER_SINGLE: bool = True
 
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "track_title":       6.0,

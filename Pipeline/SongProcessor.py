@@ -153,7 +153,7 @@ class SongProcessor:
 
         if not m.compilation:
             norm_aa    = TextCleaner.normalize(m.album_artist)
-            norm_pa    = TextCleaner.normalize(primary_artist)
+            norm_pa    = TextCleaner.normalize(primary_artist)   # ← qui è già corretto, usa primary_artist
             is_various = norm_aa in _VARIOUS_ARTISTS_TOKENS
             m.compilation = is_various or (bool(m.album_artist) and bool(primary_artist) and norm_aa != norm_pa)
 

@@ -235,6 +235,8 @@ class VersionGuard:
         mb_artist = TextCleaner.clean_text(
             (mb.recording or {}).get("artist_cleaned", ""), field_type="artist"
         )
+        if not mb_artist:
+            return True  # nessun dato artista MB per contraddire
         it_artist = TextCleaner.clean_text(
             itunes.data.get("artist", ""), field_type="artist"
         )
