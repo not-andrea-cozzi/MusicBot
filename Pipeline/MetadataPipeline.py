@@ -550,23 +550,67 @@ class MetadataPipeline:
                 TextCleaner.title_similarity(hint_norm, TextCleaner.normalize(album.collection_name or ""))
                 if hint_norm else 0.0
             )
-            edition_bonus = 0.0
-            if hint_edition and edition:
-                edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
-            elif edition:
-                if edition.kind is ReleaseKind.COMPILATION:
-                    edition_bonus = -0.5
-                elif not edition.is_short_form:
-                    edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
+            edition_bonus = self._edition_bonus(hint_edition, edition, album.track_count or 0)
             return album_sim + edition_bonus
 
         return max(rows, key=_score)
+
+    @staticmethod
+    def _edition_bonus(
+        hint_edition: Optional[ReleaseEdition],
+        edition: ReleaseEdition,
+        track_count: int,
+    ) -> float:
+        """
+        Calcola il bonus/malus di edizione per uno scoring di candidati DB.
+
+        FIX: `ReleaseEdition.from_collection` costruito da un semplice
+        `album_hint` testuale (senza track_count reale, vedi chiamata in
+        `_db_track_by_title_artist`/`_tie_break_by_edition`) produce quasi
+        sempre `kind = UNKNOWN`, perché nessuna delle condizioni di
+        `from_collection` (collection_type esplicito, suffisso "- Single",
+        track_count noto) può essere soddisfatta con i soli dati disponibili
+        per l'hint. `ReleaseEdition.compatible_with` tratta UNKNOWN come
+        "compatibile con tutto", quindi il ramo `if hint_edition:` finiva
+        SEMPRE nel caso "compatibile" e assegnava un bonus proporzionale a
+        `track_count / 20`, premiando l'album con più tracce (es. JACKBOYS,
+        7 tracce) sopra il singolo corretto (1 traccia) anche quando l'hint
+        non diceva nulla di specifico sull'edizione attesa.
+
+        Qui il caso "hint non informativo" (hint_edition assente o UNKNOWN)
+        viene trattato esplicitamente come il caso "nessun hint": si applica
+        la preferenza per singolo/EP, non un bonus proporzionale alla
+        dimensione della release.
+        """
+        hint_is_informative = hint_edition is not None and hint_edition.kind is not ReleaseKind.UNKNOWN
+
+        if hint_is_informative:
+            return min((track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
+
+        if edition.kind is ReleaseKind.COMPILATION:
+            return -0.5
+        if edition.is_short_form:
+            return 0.20
+        return -0.10
 
     def _finalize_from_db(self, ctx: PipelineContext) -> Song:
         song = ctx.song
         song.meta.apply(ctx.db_hit, overwrite_keys=set(ctx.db_hit.keys()))
         if ctx.mb_track_disc:
-            self._apply_mb_track_disc(song, ctx.mb_track_disc)
+            db_has_track = bool(ctx.db_hit.get("track_number"))
+            db_has_disc = bool(ctx.db_hit.get("disc_number"))
+            filtered_mb_track_disc = {
+                k: v for k, v in ctx.mb_track_disc.items()
+                if not (k == "track_number" and db_has_track)
+                and not (k == "disc_number" and db_has_disc)
+            }
+            if filtered_mb_track_disc:
+                self._apply_mb_track_disc(song, filtered_mb_track_disc)
+            elif ctx.mb_track_disc:
+                self.log.debug(
+                    "[Pipeline] mb_track_disc scartato: DB-hit ha già "
+                    "track_number/disc_number autoritativi."
+                )
         ctx.accurate_artists = (ctx.spotify_mapped or {}).get("artist_collection", "")
         self._finalize_artist_collection(
             song, ctx.accurate_artists, itunes_artist_raw=ctx.db_hit.get("artist", ""),
@@ -1015,19 +1059,14 @@ class MetadataPipeline:
                         collection_type=album.collection_type or "", collection_name=album.collection_name or "",
                         track_count=album.track_count or 0, title_norm=title_norm,
                     )
-                    if hint_edition:
-                        edition_bonus = min((album.track_count or 1) / 20.0, 0.3) if hint_edition.compatible_with(edition) else -0.5
-                    elif edition.kind is ReleaseKind.COMPILATION:
-                        edition_bonus = -0.5
-                    elif not edition.is_short_form:
-                        edition_bonus = min((album.track_count or 1) / 40.0, 0.15)
+                    edition_bonus = self._edition_bonus(hint_edition, edition, album.track_count or 0)
 
             combined = score + edition_bonus
             if combined > best_combined:
                 best_combined, best_track = combined, row
 
         return best_track
-
+    
     async def _db_track_to_meta(self, track: AppleMusicTrack) -> Dict[str, Any]:
         from Providers.ItunesProvider import ITunesProvider as _IP
         raw = _IP._track_model_to_dict(track)
