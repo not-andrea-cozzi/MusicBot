@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from typing import Optional
 
 import httpx
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
 from Model.SongMeta import SongMeta
+from Algorithm.TextCleaner import TextCleaner
 
 
 STOREFRONT_IDS = {
@@ -35,8 +35,7 @@ def get_store_code(country_code: str, default: int = 143441) -> int:
 
 class SongMetaWriter:
 
-    log = logging.getLogger("ScariMusicBot")
-    ATOMICPARSLEY_BIN = "AtomicParsley"
+    log = logging.getLogger(__name__)
 
     @classmethod
     def write(
@@ -50,7 +49,6 @@ class SongMetaWriter:
         tags = cls.build_tags(meta)
         cover = cover_bytes or cls._fetch_cover(cover_url or meta.cover_url, timeout=timeout)
         cls._write_to_file(path, tags, cover)
-        cls._apply_apple_atoms(path, meta)
         cls.log.debug(f"[SongMetaWriter] Tag scritti su '{path}' ({len(tags)} atomi).")
 
     @staticmethod
@@ -61,9 +59,12 @@ class SongMetaWriter:
     def build_tags(cls, m: SongMeta) -> dict:
         tags: dict = {}
 
+        if m.title:
+            tags["\xa9nam"] = [m.title]
+        if m.artist:
+            tags["\xa9ART"] = [TextCleaner.primary_artist(m.artist)]
+
         text_atoms = (
-            ("\xa9nam", "title"),
-            ("\xa9ART", "artist"),
             ("aART",    "album_artist"),
             ("\xa9alb", "album"),
             ("\xa9gen", "genre"),
@@ -74,8 +75,6 @@ class SongMetaWriter:
         )
         for atom, attr in text_atoms:
             v = getattr(m, attr, "") or ""
-            if not v and attr == "artist_collection":
-                v = m.artist
             if v:
                 tags[atom] = [v]
 
@@ -101,7 +100,7 @@ class SongMetaWriter:
         tags["rtng"] = [4 if m.explicit else 0]
         tags["stik"] = [m.media_type]
         tags["pgap"] = [0]
-        tags["akID"] = [1]  # 1 = iTunes Store account
+        tags["akID"] = [1]
 
         if m.label:
             tags["\xa9lab"] = [m.label]
@@ -158,30 +157,6 @@ class SongMetaWriter:
         tags["\xa9too"] = ["iTunes 12.12.0.1"]
 
         return tags
-
-    @classmethod
-    def _apply_apple_atoms(cls, path: str, m: SongMeta) -> None:
-        """purl/ldes non gestiti da mutagen: richiedono AtomicParsley."""
-        purl = getattr(m, "purchase_url", "")
-        ldes = getattr(m, "long_description", "")
-        if not purl and not ldes:
-            return
-
-        args = [cls.ATOMICPARSLEY_BIN, path, "--overWrite"]
-        if purl:
-            args += ["--purl", purl]
-        if ldes:
-            args += ["--ldes", ldes]
-
-        try:
-            subprocess.run(args, check=True, capture_output=True, timeout=15)
-            cls.log.error("[SongMetaWriter] AtomicParsley installato.")
-        except FileNotFoundError:
-            cls.log.error("[SongMetaWriter] AtomicParsley non installato.")
-        except subprocess.CalledProcessError as exc:
-            cls.log.error(f"[SongMetaWriter] AtomicParsley fallito: {exc.stderr}")
-        except subprocess.TimeoutExpired:
-            cls.log.error("[SongMetaWriter] AtomicParsley timeout.")
 
     @classmethod
     def _fetch_cover(cls, url: Optional[str], timeout: float = 10.0) -> Optional[bytes]:
