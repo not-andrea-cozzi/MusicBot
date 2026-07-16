@@ -41,11 +41,11 @@ class MetaMapper:
             TextCleaner.primary_artist(item.get("artistName", "") or default_artist)
         )
         is_various   = norm_aa in ("various artists", "aa.vv.", "artisti vari")
-        is_group     = bool(raw_album_artist) and bool(norm_pa) and norm_aa != norm_pa
         is_itunes_compilation = (
             item.get("collectionType") == "Compilation"
             and TextCleaner.normalize(item.get("collectionArtistName", "")) == "various artists"
         )
+        is_group = bool(raw_album_artist) and bool(norm_pa) and not TextCleaner.is_collab_album_artist(norm_pa, norm_aa)
         is_compilation = is_various or is_group or is_itunes_compilation
 
         log.debug(

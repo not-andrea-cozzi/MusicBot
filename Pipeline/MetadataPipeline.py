@@ -724,7 +724,8 @@ class MetadataPipeline:
         norm_aa = TextCleaner.normalize(m.album_artist)
         norm_primary = TextCleaner.normalize(TextCleaner.primary_artist(m.artist))
         is_various = norm_aa in MusicPatterns.VARIOUS_ARTISTS
-        m.compilation = is_various or bool(norm_primary and norm_aa and norm_primary != norm_aa)
+        is_collab = TextCleaner.is_collab_album_artist(norm_primary, norm_aa)
+        m.compilation = is_various or bool(norm_primary and norm_aa and not is_collab)
 
     # ── Anno ─────────────────────────────────────────────────────────────
 

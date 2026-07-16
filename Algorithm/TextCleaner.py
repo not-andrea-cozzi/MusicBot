@@ -265,3 +265,13 @@ class TextCleaner:
             return cls.sanitize_filename(text)
         else:
             return cls.normalize(text)
+    
+    @classmethod
+    def is_collab_album_artist(cls, primary_norm: str, album_artist_norm: str) -> bool:
+        """True if album_artist_norm contains primary_norm as a component (collab, not compilation)."""
+        if not primary_norm or not album_artist_norm:
+            return False
+        if primary_norm == album_artist_norm:
+            return True
+        import re
+        return bool(re.search(rf'\b{re.escape(primary_norm)}\b', album_artist_norm))

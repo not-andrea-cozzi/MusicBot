@@ -153,15 +153,14 @@ class SongProcessor:
 
         if not m.compilation:
             norm_aa    = TextCleaner.normalize(m.album_artist)
-            norm_pa    = TextCleaner.normalize(primary_artist)   # ← qui è già corretto, usa primary_artist
+            norm_pa    = TextCleaner.normalize(primary_artist)   #
             is_various = norm_aa in _VARIOUS_ARTISTS_TOKENS
-            m.compilation = is_various or (bool(m.album_artist) and bool(primary_artist) and norm_aa != norm_pa)
+            is_collab = TextCleaner.is_collab_album_artist(norm_pa, norm_aa)
+            m.compilation = is_various or (bool(m.album_artist) and bool(primary_artist) and not is_collab)
 
         m.set_if_empty("media_type", 1)
 
-        # ── NUOVO: flag matched — determina se il file va rinominato col
-        # titolo "arricchito" (match confermato da un provider) o col
-        # titolo originale grezzo (nessun match affidabile trovato).
+       
         m.matched = bool(
             m.itunes_track_id or m.mb_track_id or m.isrc or m._ytmusic_score >= 0.90
         )
