@@ -193,7 +193,7 @@ class LocalDbMatcher:
             return 0.0
 
         if TextCleaner.normalize(album.artist_name or "") in MusicPatterns.VARIOUS_ARTISTS:
-            return -0.5  # compilation "Various Artists": mai autoritativa per track/disc/album
+            return -0.5
 
         edition = ReleaseEdition.from_collection(
             collection_type=album.collection_type or "", collection_name=album.collection_name or "",
@@ -202,17 +202,30 @@ class LocalDbMatcher:
         if edition.kind is ReleaseKind.COMPILATION:
             return -0.5
 
+        album_norm = TextCleaner.normalize(album.collection_name or "")
+
+        # NUOVO: match album esplicito ha priorità assoluta su tutto il resto.
+        # Se l'utente/seed fornisce un hint_album, un candidato il cui album
+        # combacia (quasi) esattamente deve vincere sempre contro un candidato
+        # con lo stesso titolo/artista ma album diverso (es. singolo random
+        # con lo stesso nome trovato per primo nel DB).
+        if q.hint_norm:
+            sim = TextCleaner.album_edition_similarity(q.hint_norm, album_norm)
+            if sim >= 0.90:
+                return 1.0          # match album quasi esatto: bonus massimo
+            if sim >= 0.70:
+                return 0.5 + sim * 0.3
+
         if q.expects_short_form:
             return 0.20 if edition.is_short_form else -0.15
 
-       
-        album_norm = TextCleaner.normalize(album.collection_name or "")
-        sim = TextCleaner.album_edition_similarity(q.hint_norm, album_norm)
-        if sim >= 0.85:
-            return 0.35
-        if edition.is_short_form:
-            return -0.25  # in DB c'è solo il single, ma cercavamo un brano d'album
-        return sim * 0.3 - 0.05
+        if q.hint_norm:
+            sim = TextCleaner.album_edition_similarity(q.hint_norm, album_norm)
+            if edition.is_short_form:
+                return -0.25
+            return sim * 0.3 - 0.05
+
+        return 0.0
 
 
     @staticmethod

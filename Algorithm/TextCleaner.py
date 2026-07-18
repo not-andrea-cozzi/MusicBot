@@ -52,6 +52,12 @@ class TextCleaner:
 
     RELEASE_NEGATIVE = {"Compilation", "Live", "Remix", "Soundtrack", "DJ-mix", "Broadcast"}
 
+    # Nomi d'arte con separatori (&, ',') che NON vanno spezzati in primary_artist.
+    # Match esatto (case-insensitive, whole string) prima dello split standard.
+    _KNOWN_MULTI_ARTISTS = frozenset({
+        "takagi & ketra", "tyler, the creator", "earth, wind & fire",
+    })
+
     @classmethod
     def normalize(cls, s: str) -> str:
         if not s:
@@ -61,15 +67,13 @@ class TextCleaner:
         s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
         return s.lower().strip()
 
-    @staticmethod
-    def primary_artist(artist: str) -> str:
+    @classmethod
+    def primary_artist(cls, artist: str) -> str:
         if not artist:
             return ""
-        al = artist.lower()
-        if "tyler, the creator" in al:
-            return "Tyler, the Creator"
-        if "earth, wind & fire" in al:
-            return "Earth, Wind & Fire"
+        al = artist.lower().strip()
+        if al in cls._KNOWN_MULTI_ARTISTS:
+            return artist.strip()
         return re.split(
             r'\s+(?:x|and)\s+|\s*&\s*|\s+ft\.?\s+|\s+feat\.?\s+|,\s+',
             artist, maxsplit=1, flags=re.IGNORECASE
@@ -265,7 +269,7 @@ class TextCleaner:
             return cls.sanitize_filename(text)
         else:
             return cls.normalize(text)
-    
+
     @classmethod
     def is_collab_album_artist(cls, primary_norm: str, album_artist_norm: str) -> bool:
         """True if album_artist_norm contains primary_norm as a component (collab, not compilation)."""
@@ -273,5 +277,4 @@ class TextCleaner:
             return False
         if primary_norm == album_artist_norm:
             return True
-        import re
         return bool(re.search(rf'\b{re.escape(primary_norm)}\b', album_artist_norm))

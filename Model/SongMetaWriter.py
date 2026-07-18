@@ -61,11 +61,15 @@ class SongMetaWriter:
 
         if m.title:
             tags["\xa9nam"] = [m.title]
+
         if m.artist:
-            tags["\xa9ART"] = [TextCleaner.primary_artist(m.artist)]
+            tags["\xa9ART"] = [m.artist_collection or TextCleaner.primary_artist(m.artist)]
+
+        
+        if m.album_artist:
+            tags["aART"] = [TextCleaner.primary_artist(m.album_artist)]
 
         text_atoms = (
-            ("aART",    "album_artist"),
             ("\xa9alb", "album"),
             ("\xa9gen", "genre"),
             ("\xa9wrt", "composer"),
