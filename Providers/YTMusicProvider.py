@@ -1,10 +1,11 @@
 import threading
 import logging
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from Algorithm.BestMatch import similarity
+from Algorithm.BestMatch import TrackMatcher
 from Algorithm.TextCleaner import TextCleaner
 from Model.SongMeta import SongMeta
+from Utils.MusicPatterns import MusicPatterns
 
 try:
     from ytmusicapi import YTMusic
@@ -26,12 +27,23 @@ def _normalize_thumb_url(url: str) -> str:
 class YTMusicProvider:
     """Provider per la ricerca e l'estrazione dei metadati da YouTube Music."""
 
-    def __init__(self, accept_score: float, fallback_score: float, logger: logging.Logger):
+    def __init__(
+        self,
+        accept_score: float,
+        fallback_score: float,
+        logger: logging.Logger,
+        matcher: Optional[TrackMatcher] = None,
+    ):
         self.logger = logger
         self.accept_score = accept_score
         self.fallback_score = fallback_score
         self.client = None
         self.is_active = False
+
+        # Stesso TrackMatcher (o compatibile) usato da iTunes/MB/Spotify/
+        # LocalDbMatcher: un solo algoritmo di scoring testuale per tutto
+        # il bot. Se il pipeline inietta il matcher condiviso, usa quello.
+        self.matcher = matcher or TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
 
         self._init_lock = threading.Lock()
 
@@ -46,6 +58,10 @@ class YTMusicProvider:
             self._initialize_client()
         else:
             self.logger.warning("[YTMusic] Modulo ytmusicapi non installato. Provider disabilitato.")
+
+    def set_matcher(self, matcher: TrackMatcher) -> None:
+        """Permette al pipeline di iniettare il matcher condiviso (stesso pattern di MusicBrainzApiRequstor/SpotifyProvider)."""
+        self.matcher = matcher
 
     # ------------------------------------------------------------------
     # Inizializzazione
@@ -221,7 +237,7 @@ class YTMusicProvider:
 
         best, best_score = None, -1.0
         for item in results:
-            s = self._score_item(item, title_norm, art_lower, known_album_ids, strict_artist)
+            s = self._score_item(item, title, title_norm, art, art_lower, album_hint_norm, known_album_ids, strict_artist)
             if s < self.fallback_score:
                 continue
 
@@ -245,18 +261,21 @@ class YTMusicProvider:
         return self._build_search_result(best, title, artist, title_norm, best_score)
 
     # ------------------------------------------------------------------
-    # Scoring
+    # Scoring — unificato su TrackMatcher (Algorithm.BestMatch)
     # ------------------------------------------------------------------
 
     def _score_item(
         self,
         item: dict,
+        title: str,
         title_norm: str,
+        art_primary: str,
         art_lower: str,
+        hint_album_norm: str,
         known_album_ids: set,
         strict_artist: bool = True,
     ) -> float:
-        item_artists     = item.get("artists") or [{}]
+        item_artists      = item.get("artists") or [{}]
         item_artist_lower = item_artists[0].get("name", "").lower()
 
         if strict_artist and art_lower:
@@ -270,11 +289,12 @@ class YTMusicProvider:
         if TextCleaner.has_version_tag(raw_title) != TextCleaner.has_version_tag(title_norm):
             return -1.0
 
-        item_norm  = TextCleaner.normalize(raw_title)
-        title_sim  = similarity(title_norm, item_norm)
-        score      = title_sim
-
-        if score < self.fallback_score:
+        candidate = self.ytmusic_item_to_candidate(item)
+        score = self.matcher.score_candidate(
+            title=title, artist=art_primary, album_hint="",
+            duration_ms=None, isrc="", candidate=candidate,
+        )
+        if score is None or score < self.fallback_score:
             return -1.0
 
         if art_lower and item_artist_lower == art_lower:
@@ -289,6 +309,7 @@ class YTMusicProvider:
         if album_id:
             album_data = self._get_album(album_id)
             n = self._track_count(album_data)
+            item_norm = TextCleaner.normalize(raw_title)
             album_norm = TextCleaner.normalize(album_name) if album_name else ""
             is_likely_single = (
                 n <= 2
@@ -408,9 +429,30 @@ class YTMusicProvider:
         best_i, best_sim = None, 0.0
         for i, tr in enumerate(track_list, 1):
             tr_norm = TextCleaner.normalize(tr.get("title") or "")
-            sim = similarity(norm_title, tr_norm)
+            sim = TextCleaner.title_similarity(norm_title, tr_norm)
             if sim > best_sim:
                 best_sim = sim
                 best_i = i
 
         return str(best_i) if best_i is not None and best_sim >= _TRACK_MATCH_MIN_SIM else ""
+    
+
+    def ytmusic_item_to_candidate(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        artists = item.get("artists") or [{}]
+        album_obj = item.get("album") or {}
+    
+        dur_sec = item.get("duration_seconds")
+        duration_ms = int(dur_sec) * 1000 if dur_sec else None
+    
+        return {
+            "trackName": item.get("title", "") or "",
+            "artistName": artists[0].get("name", "") if artists else "",
+            "collectionName": album_obj.get("name", "") or "",
+            "trackTimeMillis": duration_ms,
+            "isrc": "",  # non esposto dai risultati di ricerca YTMusic
+        }
+    
+
+        
+
+

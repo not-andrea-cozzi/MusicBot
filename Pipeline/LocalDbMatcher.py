@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
-from sqlalchemy import select, or_, and_
+from sqlalchemy import func, select, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from Algorithm.BestMatch import TrackMatcher, strip_parenthetical
@@ -43,6 +43,12 @@ class LocalDbMatcher:
         self.matcher = matcher or TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
         self.log = logger or logging.getLogger(__name__)
         self._album_cache: Dict[int, AppleMusicAlbum] = {}
+        # collection_id -> conteggio REALE di righe AppleMusicTrack per
+        # quell'album (non il campo denormalizzato AppleMusicAlbum.track_count,
+        # che può essere stale/assente per album con origine YouTube).
+        # Popolata da _preload_track_counts, una sola query aggregata per
+        # batch di candidati invece di N query separate.
+        self._real_track_count_cache: Dict[int, int] = {}
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -94,6 +100,7 @@ class LocalDbMatcher:
         if not rows:
             return None
         await self._preload_albums(rows)
+        await self._preload_track_counts(rows)
 
         best_track, best_score = None, -1.0
         for row in rows:
@@ -136,9 +143,8 @@ class LocalDbMatcher:
                 return rows[0]
 
         await self._preload_albums(rows)
+        await self._preload_track_counts(rows)
         return max(rows, key=lambda r: self._edition_score(r, q))
-
-   
 
     async def _candidate_rows(self, title_norm: str, artist_norm: str) -> list[AppleMusicTrack]:
         title_kw = self._keywords(title_norm)
@@ -166,8 +172,6 @@ class LocalDbMatcher:
         words = {w for w in norm.split() if len(w) >= cls.MIN_KEYWORD_LEN and w not in TextCleaner._STOPWORDS}
         return sorted(words, key=len, reverse=True)[: cls.MAX_KEYWORDS_PER_FIELD]
 
-   
-
     async def _preload_albums(self, rows: Iterable[AppleMusicTrack]) -> None:
         ids = {r.collection_id for r in rows if r.collection_id and r.collection_id not in self._album_cache}
         if not ids:
@@ -176,7 +180,37 @@ class LocalDbMatcher:
         for a in (await self.session.execute(stmt)).scalars().all():
             self._album_cache[a.collection_id] = a
 
-   
+    async def _preload_track_counts(self, rows: Iterable[AppleMusicTrack]) -> None:
+        """
+        Conta le righe AppleMusicTrack REALI per ciascun collection_id
+        candidato, in una singola query aggregata (COUNT ... GROUP BY),
+        invece di fidarsi solo di AppleMusicAlbum.track_count.
+
+        Perché serve: track_count su AppleMusicAlbum è scritto SOLO da
+        ITunesProvider._persist_lookup_results, quindi è affidabile per
+        album con origine iTunes ma può essere assente/stale per album la
+        cui unica fonte è stata YouTube (che non fornisce mai un segnale
+        testuale di edizione, es. "- Single" nel nome). Contare le righe
+        reali già presenti nel DB per quel collection_id è il segnale più
+        diretto disponibile, indipendente dal nome dell'album.
+
+        Nota: questo conta solo le tracce GIA' note al DB locale per quel
+        album, quindi è un lower-bound, non il track_count "ufficiale" del
+        catalogo. È comunque più affidabile di un campo denormalizzato
+        assente, e viene usato solo come fallback quando track_count non è
+        disponibile (vedi _edition_score).
+        """
+        ids = {r.collection_id for r in rows if r.collection_id and r.collection_id not in self._real_track_count_cache}
+        if not ids:
+            return
+        stmt = (
+            select(AppleMusicTrack.collection_id, func.count(AppleMusicTrack.track_id))
+            .where(AppleMusicTrack.collection_id.in_(ids))
+            .group_by(AppleMusicTrack.collection_id)
+        )
+        result = await self.session.execute(stmt)
+        for collection_id, count in result.all():
+            self._real_track_count_cache[collection_id] = count
 
     @staticmethod
     def _expects_short_form(hint_norm: str, title_norm: str) -> bool:
@@ -187,6 +221,53 @@ class LocalDbMatcher:
         core_title = strip_parenthetical(title_norm).strip()
         return hint_norm in (title_norm, core_title)
 
+    def _resolve_edition(self, row: AppleMusicTrack, album: AppleMusicAlbum, q: _Query) -> ReleaseEdition:
+        """
+        Risolve la ReleaseEdition del candidato usando, in ordine di
+        preferenza:
+        1. AppleMusicAlbum.track_count se > 0 (affidabile: scritto da iTunes).
+        2. Conteggio reale delle righe AppleMusicTrack per quel collection_id,
+           se track_count manca/è 0 (fallback per album di sola origine YT).
+
+        Il secondo caso produce una ReleaseEdition con track_count_verified
+        coerente (vedi ReleaseEdition.from_verified_track_count): non è più
+        un UNKNOWN "silenziosamente permissivo", ma un'edizione dedotta da
+        un conteggio reale, anche se solo un lower-bound.
+        """
+        declared_count = album.track_count or 0
+        if declared_count > 0:
+            return ReleaseEdition.from_collection(
+                collection_type=album.collection_type or "",
+                collection_name=album.collection_name or "",
+                track_count=declared_count,
+                title_norm=q.title_norm,
+                track_count_verified=True,
+            )
+
+        real_count = self._real_track_count_cache.get(row.collection_id, 0)
+        if real_count > 0:
+            self.log.debug(
+                f"[LocalDbMatcher] track_count assente per collection_id={row.collection_id}, "
+                f"uso conteggio reale DB={real_count} come fallback."
+            )
+            return ReleaseEdition.from_verified_track_count(
+                track_count=real_count,
+                collection_name=album.collection_name or "",
+                title_norm=q.title_norm,
+            )
+
+        # Nessun segnale affidabile: UNKNOWN esplicito, non verificato.
+        # Questo NON deve essere silenziosamente trattato come "va bene",
+        # va gestito esplicitamente da chi consuma questa edizione
+        # (vedi _edition_score sotto: penalità leggera invece di 0.0).
+        return ReleaseEdition.from_collection(
+            collection_type=album.collection_type or "",
+            collection_name=album.collection_name or "",
+            track_count=0,
+            title_norm=q.title_norm,
+            track_count_verified=False,
+        )
+
     def _edition_score(self, row: AppleMusicTrack, q: _Query) -> float:
         album = self._album_cache.get(row.collection_id) if row.collection_id else None
         if not album:
@@ -195,20 +276,13 @@ class LocalDbMatcher:
         if TextCleaner.normalize(album.artist_name or "") in MusicPatterns.VARIOUS_ARTISTS:
             return -0.5
 
-        edition = ReleaseEdition.from_collection(
-            collection_type=album.collection_type or "", collection_name=album.collection_name or "",
-            track_count=album.track_count or 0, title_norm=q.title_norm,
-        )
+        edition = self._resolve_edition(row, album, q)
         if edition.kind is ReleaseKind.COMPILATION:
             return -0.5
 
         album_norm = TextCleaner.normalize(album.collection_name or "")
 
-        # NUOVO: match album esplicito ha priorità assoluta su tutto il resto.
-        # Se l'utente/seed fornisce un hint_album, un candidato il cui album
-        # combacia (quasi) esattamente deve vincere sempre contro un candidato
-        # con lo stesso titolo/artista ma album diverso (es. singolo random
-        # con lo stesso nome trovato per primo nel DB).
+        # Match album esplicito ha priorità assoluta su tutto il resto.
         if q.hint_norm:
             sim = TextCleaner.album_edition_similarity(q.hint_norm, album_norm)
             if sim >= 0.90:
@@ -217,6 +291,22 @@ class LocalDbMatcher:
                 return 0.5 + sim * 0.3
 
         if q.expects_short_form:
+            if not edition.is_confident:
+                # Non sappiamo con certezza se questo candidato è un
+                # singolo o un album (nessun track_count affidabile, nessun
+                # conteggio reale > 0, nessun collection_type dal
+                # provider). Prima di questo fix questo caso otteneva -0.15
+                # (stesso trattamento di "sappiamo che è un album"), un
+                # bias implicito contro candidati semplicemente privi di
+                # dati — tipicamente le release con unica origine YouTube.
+                # Penalità più leggera ma esplicita: meglio di un secco
+                # "sappiamo che non è un singolo", ma comunque inferiore al
+                # bonus riservato a un singolo CONFERMATO.
+                self.log.debug(
+                    f"[LocalDbMatcher] edizione non verificata per collection_id={row.collection_id} "
+                    f"({edition.describe()}), applico penalità ridotta invece di trattarlo come album."
+                )
+                return -0.05
             return 0.20 if edition.is_short_form else -0.15
 
         if q.hint_norm:
@@ -226,7 +316,6 @@ class LocalDbMatcher:
             return sim * 0.3 - 0.05
 
         return 0.0
-
 
     @staticmethod
     def _has_version_tag(text: str) -> bool:
@@ -246,7 +335,7 @@ class LocalDbMatcher:
             "trackId": t.track_id, "artistId": t.artist_id, "collectionId": t.collection_id,
             "artistName": t.artist_name, "collectionName": t.collection_name, "trackName": t.track_name,
             "collectionArtistName": t.collection_artist_name, "artworkUrl100": t.artwork_url,
-            "trackExplicitness": t.track_explicitness, "discCount": t.disc_count,
+            "trackExplicitness": t.track_explicitness.lower(), "discCount": t.disc_count,
             "discNumber": t.disc_number, "trackCount": t.track_count, "trackNumber": t.track_number,
             "trackTimeMillis": t.track_time_millis, "primaryGenreName": t.primary_genre_name,
             "isrc": t.isrc,

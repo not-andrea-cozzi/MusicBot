@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
+from Algorithm.BestMatch import TrackMatcher
 from Algorithm.TextCleaner import TextCleaner
+from Utils.MusicPatterns import MusicPatterns
 
 
 class SpotifyProvider:
@@ -21,25 +23,30 @@ class SpotifyProvider:
         re.IGNORECASE,
     )
 
-    # NUOVO: stesso pattern usato altrove (MusicBrainzHelper, MusicPatterns)
-    # per riconoscere tag di versione "legittimi" (remix/live/acoustic/ecc.),
-    # usato da search_allow_version_tag per accettare esplicitamente
-    # candidati con questo tag invece di scartarli.
-    _VERSION_TAG_RE = re.compile(
-        r'[\(\[]\s*(?:remix|re-?mix|radio\s+edit|extended|vip|club\s+mix|'
-        r'dub\s+mix|original\s+mix|acoustic|live|demo|instrumental)\b',
-        re.IGNORECASE,
-    )
+    # Stesso pattern usato altrove (MusicBrainzHelper, MusicPatterns) per
+    # riconoscere tag di versione "legittimi" (remix/live/acoustic/ecc.).
+    # Usato per il bonus esplicito in search_allow_version_tag e per capire
+    # se il titolo cercato richiede un tag di versione nel candidato.
+    _VERSION_TAG_RE = MusicPatterns.VERSION_TAG_RE
 
     def __init__(
         self,
         client_id: str,
         client_secret: str,
         logger: Optional[logging.Logger] = None,
+        matcher: Optional[TrackMatcher] = None,
     ) -> None:
         self.log = logger or logging.getLogger(__name__)
         self.is_active = False
         self._last_call_ts: float = 0.0
+
+        # Stesso TrackMatcher (o compatibile) usato da iTunes/MB/LocalDbMatcher:
+        # un solo algoritmo di scoring per tutto il bot. Se il pipeline
+        # inietta il proprio matcher condiviso (vedi MetadataPipeline.__init__
+        # -> self.matcher), usa quello; altrimenti istanzia uno di default
+        # con la stessa soglia minima usata altrove.
+        self.matcher = matcher or TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
+
         try:
             auth = SpotifyClientCredentials(
                 client_id=client_id,
@@ -51,6 +58,10 @@ class SpotifyProvider:
         except Exception as exc:
             self.log.warning(f"[Spotify] Init fallita: {exc}")
 
+    def set_matcher(self, matcher: TrackMatcher) -> None:
+        """Permette al pipeline di iniettare il matcher condiviso (stesso pattern di MusicBrainzApiRequstor)."""
+        self.matcher = matcher
+
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_call_ts
         wait = self.REQUEST_DELAY - elapsed
@@ -58,6 +69,9 @@ class SpotifyProvider:
             time.sleep(wait)
         self._last_call_ts = time.monotonic()
 
+    # ------------------------------------------------------------------
+    # Public search
+    # ------------------------------------------------------------------
     def search(
         self,
         title: str,
@@ -102,7 +116,7 @@ class SpotifyProvider:
             except Exception:
                 return None
 
-        best = self._pick_best(tracks, title, artist, duration_ms)
+        best = self._pick_best(tracks, title, artist, duration_ms, allow_tag=False)
         if best:
             self.log.debug(
                 f"[Spotify] Trovato: '{best.get('name')}' "
@@ -121,30 +135,14 @@ class SpotifyProvider:
         """
         Retry esplicito per quando il titolo richiede un tag di versione
         (remix/live/acoustic/ecc.) ma `search()` non ha trovato un candidato
-        coerente. Differenze rispetto a `search()`:
-
-        - Query senza il termine `track:` quotato sull'intero titolo (che
-          su Spotify può comportarsi come ricerca esatta e scartare la
-          traccia se il titolo indicizzato differisce anche di poco, es.
-          per un featuring incluso solo nel campo artisti): usa invece il
-          titolo come termine libero + filtro artista.
-        - `_pick_best_allow_tag` non scarta i candidati che hanno un tag di
-          versione nel nome (a differenza di `_pick_best`, che comunque non
-          li escludeva esplicitamente se non in _EXCLUDE_TITLE_RE — questa
-          variante aggiunge un bonus di score ai candidati che hanno
-          ESPLICITAMENTE lo stesso tag richiesto, per preferirli a parità
-          di altri fattori).
-
-        Non sostituisce `search()`: va chiamato solo come secondo tentativo
-        quando il primo giro fallisce o produce un match senza il tag.
+        coerente. Query senza `track:` quotato (termine libero + filtro
+        artista), e selezione che RICHIEDE esplicitamente il tag di
+        versione nel candidato (vedi `_pick_best` con allow_tag=True).
         """
         if not self.is_active or not title:
             return None
 
         art_primary = TextCleaner.primary_artist(artist) if artist else ""
-        # Termine libero (non quotato con track:) per massimizzare il recall
-        # quando il titolo ha un tag tra parentesi che potrebbe non essere
-        # indicizzato identicamente su Spotify.
         free_title = re.sub(r'[\(\[][^\)\]]*[\)\]]', '', title).strip() or title
         tag_match = re.search(r'[\(\[]([^\)\]]+)[\)\]]', title)
         tag = tag_match.group(1).strip() if tag_match else ""
@@ -164,7 +162,7 @@ class SpotifyProvider:
         if not tracks:
             return None
 
-        best = self._pick_best_allow_tag(tracks, title, artist, duration_ms)
+        best = self._pick_best(tracks, title, artist, duration_ms, allow_tag=True)
         if best:
             self.log.debug(
                 f"[Spotify] (retry tag) Trovato: '{best.get('name')}' "
@@ -182,80 +180,32 @@ class SpotifyProvider:
             self.log.debug(f"[Spotify] ISRC search fallita: {exc}")
             return None
 
-    def _pick_best(self, tracks, title, artist, duration_ms):
-        title_norm  = TextCleaner.normalize(title)
-        artist_norm = TextCleaner.normalize(TextCleaner.primary_artist(artist)) if artist else ""
-        best, best_score = None, -1.0
-
-        for t in tracks:
-            t_name = t.get("name", "")
-            if self._EXCLUDE_TITLE_RE.search(t_name) and not self._EXCLUDE_TITLE_RE.search(title):
-                continue
-
-            t_norm = TextCleaner.normalize(t_name)
-            title_sim = TextCleaner.title_similarity(title_norm, t_norm)
-            if title_sim < 0.75:
-                continue
-
-            artists = t.get("artists", [])
-            a_norm  = TextCleaner.normalize(artists[0].get("name", "")) if artists else ""
-            art_sim = TextCleaner.title_similarity(artist_norm, a_norm) if artist_norm else 1.0
-            if art_sim < 0.70:
-                continue
-
-            score = 0.6 * title_sim + 0.4 * art_sim
-            cand_ms = t.get("duration_ms")
-            if duration_ms and cand_ms and abs(duration_ms - cand_ms) <= 5000:
-                score += 0.05
-
-            if score > best_score:
-                best_score, best = score, t
-
-        return best
-
-    def _pick_best_allow_tag(self, tracks, title, artist, duration_ms):
-        """
-        Variante di _pick_best usata da search_allow_version_tag: richiede
-        ESPLICITAMENTE che il candidato abbia lo stesso tag di versione del
-        titolo cercato (remix/live/acoustic/ecc.), scartando i candidati che
-        ne sono privi — l'inverso esatto del problema originale, dove la
-        versione "pulita" (originale) vinceva per somiglianza testuale pur
-        non essendo quella richiesta.
-        """
-        title_norm  = TextCleaner.normalize(title)
-        artist_norm = TextCleaner.normalize(TextCleaner.primary_artist(artist)) if artist else ""
-        wants_tag   = bool(self._VERSION_TAG_RE.search(title))
+    # ------------------------------------------------------------------
+    # Selezione candidato — unificata su TrackMatcher (Algorithm.BestMatch)
+    # ------------------------------------------------------------------
+    def _pick_best(self, tracks: list, title: str, artist: str, duration_ms: Optional[int], allow_tag: bool) -> Optional[dict]:
+        art_primary = TextCleaner.primary_artist(artist) if artist else ""
+        wants_tag = bool(self._VERSION_TAG_RE.search(title)) if allow_tag else False
 
         best, best_score = None, -1.0
-
         for t in tracks:
             t_name = t.get("name", "")
 
             if self._EXCLUDE_TITLE_RE.search(t_name) and not self._EXCLUDE_TITLE_RE.search(title):
                 continue
 
-            has_tag = bool(self._VERSION_TAG_RE.search(t_name))
-            if wants_tag and not has_tag:
-                continue  # scarta la versione "pulita": non è quella richiesta
+            if allow_tag:
+                has_tag = bool(self._VERSION_TAG_RE.search(t_name))
+                if wants_tag and not has_tag:
+                    continue  # scarta la versione "pulita": non è quella richiesta
 
-            t_norm = TextCleaner.normalize(t_name)
-            title_sim = TextCleaner.title_similarity(title_norm, t_norm)
-            if title_sim < 0.60:
-                # soglia più permissiva di _pick_best: un titolo con tag
-                # versione e featuring può discostarsi più del solito dal
-                # titolo "seed" (es. "Leaked (Remix)" vs "Leaked (feat. X) [Remix]")
+            candidate = self.spotify_track_to_candidate(t)
+            score = self.matcher.score_candidate(
+                title=title, artist=art_primary, album_hint="",
+                duration_ms=duration_ms, isrc="", candidate=candidate,
+            )
+            if score is None:
                 continue
-
-            artists = t.get("artists", [])
-            a_norm  = TextCleaner.normalize(artists[0].get("name", "")) if artists else ""
-            art_sim = TextCleaner.title_similarity(artist_norm, a_norm) if artist_norm else 1.0
-            if art_sim < 0.70:
-                continue
-
-            score = 0.6 * title_sim + 0.4 * art_sim
-            cand_ms = t.get("duration_ms")
-            if duration_ms and cand_ms and abs(duration_ms - cand_ms) <= 5000:
-                score += 0.05
 
             if score > best_score:
                 best_score, best = score, t
@@ -313,3 +263,17 @@ class SpotifyProvider:
             "duration_ms":       track.get("duration_ms"),
             "artist_collection": artist_collection
         }
+    
+    def spotify_track_to_candidate(self, track: Dict[str, Any]) -> Dict[str, Any]:
+        artists = track.get("artists", [])
+        album_obj = track.get("album", {}) or {}
+        external_ids = track.get("external_ids", {}) or {}
+    
+        return {
+            "trackName": track.get("name", "") or "",
+            "artistName": artists[0].get("name", "") if artists else "",
+            "collectionName": album_obj.get("name", "") or "",
+            "trackTimeMillis": track.get("duration_ms"),
+            "isrc": external_ids.get("isrc", "") or "",
+        }
+    

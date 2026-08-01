@@ -1,4 +1,3 @@
-# Pipeline/SongProcessor.py
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +7,7 @@ import re
 from typing import Optional
 
 from Model.Song import Song
-from Pipeline.MetadataPipeline import MetadataPipeline
+from Pipeline.Pipeline import MetadataPipeline
 from Utils.CoverManager import CoverManager
 from Model.SongFileManager import SongFileManager
 from Algorithm.TextCleaner import TextCleaner

@@ -14,7 +14,7 @@ from Providers.SpotifyProvider import SpotifyProvider
 from Utils.CoverManager import CoverManager
 from Utils.YTDownloader import Downloader
 from Model.Song import Song
-from Pipeline.MetadataPipeline import MetadataPipeline
+from Pipeline.Pipeline import MetadataPipeline
 from Providers.MusicBrainzApi import MusicBrainzApiRequstor
 from Model.SongFileManager import SongFileManager
 from classes.configloader import ConfigLoader

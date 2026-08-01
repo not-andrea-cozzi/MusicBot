@@ -28,7 +28,7 @@ class MetaMapper:
         disc_number  = int(item["discNumber"])  if item.get("discNumber")  else 0
 
         explicit_raw = item.get("trackExplicitness", "")
-        is_explicit  = explicit_raw  in ("explicit", "cleaned")
+        is_explicit  = explicit_raw.lower()  in ("explicit", "cleaned")
 
         raw_album_artist = (
             item.get("collectionArtistName", "")
