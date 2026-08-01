@@ -63,7 +63,7 @@ class SongMetaWriter:
             tags["\xa9nam"] = [m.title]
 
         if m.artist:
-            tags["\xa9ART"] = [m.artist_collection or TextCleaner.primary_artist(m.artist)]
+            tags["\xa9ART"] = [m.artist_collection or m.artist]
 
         
         if m.album_artist:

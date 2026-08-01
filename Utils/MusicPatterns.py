@@ -36,6 +36,9 @@ class MusicPatterns:
 
     @staticmethod
     def normalize_artist_list(s: str) -> str:
+        from Algorithm.TextCleaner import TextCleaner
+        if s.strip().lower() in TextCleaner._KNOWN_MULTI_ARTISTS:
+            return s.strip()
         return re.sub(
             r"\s*(?:feat\.?|ft\.?|with|&|\+|and|;)\s*", ", ", s, flags=re.IGNORECASE
         ).strip(", ")

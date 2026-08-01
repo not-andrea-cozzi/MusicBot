@@ -52,10 +52,25 @@ class TextCleaner:
 
     RELEASE_NEGATIVE = {"Compilation", "Live", "Remix", "Soundtrack", "DJ-mix", "Broadcast"}
 
-    # Nomi d'arte con separatori (&, ',') che NON vanno spezzati in primary_artist.
-    # Match esatto (case-insensitive, whole string) prima dello split standard.
+   
     _KNOWN_MULTI_ARTISTS = frozenset({
         "takagi & ketra", "tyler, the creator", "earth, wind & fire",
+        "simon & garfunkel", "hall & oates", "florence + the machine",
+        "ike & tina turner", "sonny & cher", "the mamas & the papas",
+        "kool & the gang", "brooks & dunn", "salt-n-pepa",
+        "peaches & herb", "ashford & simpson", "captain & tennille",
+        "mickey & sylvia", "sam & dave", "the righteous brothers",
+        "loggins & messina", "seals & crofts", "derek & the dominos",
+        "daryl hall & john oates", "the everly brothers",
+        "the isley brothers", "gladys knight & the pips",
+        "diana ross & the supremes", "martha & the vandellas",
+        "booker t. & the mg's", "toots & the maytals",
+        "chase & status", "hootie & the blowfish",
+        "huey lewis & the news", "bill haley & his comets",
+        "danny & the juniors", "chloe x halle", "dan + shay",
+        "bruno mars & anderson .paak", "anderson .paak & bruno mars",
+        "matt & kim", "tegan & sara", "above & beyond",
+        "kid 'n play", "florence & the machine",
     })
 
     @classmethod
