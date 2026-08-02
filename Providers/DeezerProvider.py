@@ -28,19 +28,14 @@ class DeezerProvider:
         client: Optional[httpx.AsyncClient] = None,
         timeout: float = 10.0,
         logger: Optional[logging.Logger] = None,
-        local_cache=None,
     ) -> None:
         self.log = logger or logging.getLogger(__name__)
-        self.http = DeezerHttpClient(client=client, timeout=timeout, logger=self.log, local_cache=local_cache)
+        self.http = DeezerHttpClient(client=client, timeout=timeout, logger=self.log)
 
     async def close(self) -> None:
         await self.http.close()
 
-    # ------------------------------------------------------------------
-    # Helper condiviso: arricchisce un best-track con track_data + album_data
-    # (track_number, disc_number, isrc, genre, year, upc). Usato da
-    # get_full_metadata, search_by_title_artist, search_recording.
-    # ------------------------------------------------------------------
+
     async def _enrich_from_track(self, best: dict) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
 
@@ -352,17 +347,8 @@ class DeezerProvider:
         result["artist_collection"] = enriched.get("artist_collection", "")
         result["isrc"] = enriched.get("isrc", "")
         result["explicit"] = enriched.get("explicit", False)
-        if "track_number" in enriched:
-            result["track_number"] = enriched["track_number"]
-        if "disc_number" in enriched:
-            result["disc_number"] = enriched["disc_number"]
-        if "genre" in enriched:
-            result["genre"] = enriched["genre"]
-        if "year" in enriched:
-            result["year"] = enriched["year"]
-        if "upc" in enriched:
-            result["upc"] = enriched["upc"]
-        if "_release_edition_kind" in enriched:
-            result["_release_edition_kind"] = enriched["_release_edition_kind"]
+        for k in ("track_number", "disc_number", "genre", "year", "upc", "_release_edition_kind"):
+            if k in enriched:
+                result[k] = enriched[k]
 
         return result

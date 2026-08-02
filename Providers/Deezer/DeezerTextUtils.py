@@ -1,24 +1,11 @@
 import re
 import unicodedata
 from typing import Optional
+from Utils.MusicPatterns import MusicPatterns
 
-_ALT_VERSION_RE = re.compile(
-    r'\b(instrumental(?:s)?|karaoke|a\s*cappella(?:s)?|acapella(?:s)?|sped\s*up|'
-    r'nightcore|slowed(?:\s*(?:and|&)?\s*reverb(?:ed)?)?|8d\s*audio|tiktok\s*remix)\b',
-    re.IGNORECASE,
-)
-
-_VERSION_TAG_RE = re.compile(
-    r'\b(?:remix|re-?mix|radio\s+edit|extended|vip|club\s+mix|'
-    r'dub\s+mix|original\s+mix|acoustic|live|demo)\b',
-    re.IGNORECASE,
-)
-
-_DELUXE_RE = re.compile(
-    r'\b(?:deluxe|expanded|super\s+deluxe|anniversary|remastered|'
-    r'special\s+edition|bonus\s+track)\b',
-    re.IGNORECASE,
-)
+_ALT_VERSION_RE = MusicPatterns.ALT_VERSION_RE
+_VERSION_TAG_RE = MusicPatterns.VERSION_TAG_RE
+_DELUXE_RE = MusicPatterns.DELUXE_TAG_RE
 
 
 def is_alt_version(text: str) -> bool:

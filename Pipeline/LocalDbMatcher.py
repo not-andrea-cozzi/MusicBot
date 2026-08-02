@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sqlalchemy import func, select, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,10 +38,17 @@ class LocalDbMatcher:
         session: AsyncSession,
         matcher: Optional[TrackMatcher] = None,
         logger: Optional[logging.Logger] = None,
+        min_score: float = MusicPatterns.DB_LOCAL_MIN_SCORE,
     ) -> None:
         self.session = session
         self.matcher = matcher or TrackMatcher(min_score=MusicPatterns.MATCHER_MIN_SCORE)
         self.log = logger or logging.getLogger(__name__)
+        # Soglia di accettazione del DB-hit come step 1 della pipeline.
+        # Distinta da self.matcher._min_score: quest'ultima è la soglia
+        # "grezza" del TrackMatcher (usata anche altrove, es. iTunes/MB),
+        # questa è la soglia più severa richiesta per bloccare l'intera
+        # ricerca remota su un solo hit locale.
+        self.min_score = min_score
         self._album_cache: Dict[int, AppleMusicAlbum] = {}
         # collection_id -> conteggio REALE di righe AppleMusicTrack per
         # quell'album (non il campo denormalizzato AppleMusicAlbum.track_count,
@@ -55,16 +62,24 @@ class LocalDbMatcher:
     async def find(
         self, title: str, artist: str = "", album_hint: str = "",
         duration_ms: Optional[int] = None, isrc: str = "",
-    ) -> Optional[AppleMusicTrack]:
-        """Priorità a titolo+artista+album (segnale diretto); ISRC solo come fallback."""
+    ) -> Optional[Tuple[AppleMusicTrack, float]]:
+        """
+        Priorità a titolo+artista+album (segnale diretto); ISRC solo come
+        fallback quando title/artist non trovano nulla.
+
+        Ritorna (track, score) solo se score >= self.min_score. Un match
+        trovato ma sotto soglia è considerato un miss: nessuna riga viene
+        ritornata, così il chiamante prosegue con iTunes/fallback invece
+        di fidarsi di un hit locale debole.
+        """
         if not title or not title.strip():
             return None
 
         q = self._build_query(title, artist, album_hint, duration_ms, isrc)
         try:
-            track = await self._find_by_title_artist(q)
-            if track:
-                return track
+            hit = await self._find_by_title_artist(q)
+            if hit:
+                return hit
             if q.isrc:
                 return await self._find_by_isrc(q)
         except Exception as exc:
@@ -93,10 +108,10 @@ class LocalDbMatcher:
             expects_short_form=self._expects_short_form(hint_norm, title_norm),
         )
 
-    # ── Title/Artist path ────────────────────────────────────────────
+    # ── Title/Artist/Album path ──────────────────────────────────────
 
-    async def _find_by_title_artist(self, q: _Query) -> Optional[AppleMusicTrack]:
-        rows = await self._candidate_rows(q.title_norm, q.artist_norm)
+    async def _find_by_title_artist(self, q: _Query) -> Optional[Tuple[AppleMusicTrack, float]]:
+        rows = await self._candidate_rows(q.title_norm, q.artist_norm, q.hint_norm)
         if not rows:
             return None
         await self._preload_albums(rows)
@@ -119,37 +134,75 @@ class LocalDbMatcher:
                 continue
             if total > best_score:
                 best_score, best_track = total, row
-        return best_track
+
+        if best_track is None or best_score < self.min_score:
+            if best_track is not None:
+                self.log.debug(
+                    f"[LocalDbMatcher] hit title/artist sotto soglia "
+                    f"({best_score:.2f} < {self.min_score:.2f}), trattato come miss: "
+                    f"'{best_track.track_name}'"
+                )
+            return None
+        return best_track, best_score
 
     # ── ISRC path (fallback) ─────────────────────────────────────────
 
-    async def _find_by_isrc(self, q: _Query) -> Optional[AppleMusicTrack]:
+    async def _find_by_isrc(self, q: _Query) -> Optional[Tuple[AppleMusicTrack, float]]:
         stmt = select(AppleMusicTrack).where(AppleMusicTrack.isrc == q.isrc)
         rows = list((await self.session.execute(stmt)).scalars().all())
         if not rows:
             return None
-        if len(rows) == 1:
-            return rows[0]
 
         if q.has_remix:
             tagged = [r for r in rows if self._has_version_tag(r.track_name or "")]
             rows = tagged or rows
 
+        # Score di similarità titolo, usato sia per restringere i candidati
+        # con più righe sullo stesso ISRC, sia come punteggio da confrontare
+        # con la soglia min_score (l'ISRC exact match NON bypassa più la
+        # soglia: un ISRC può comparire su righe con titolo molto diverso,
+        # es. remix vs originale, quindi va comunque validato testualmente).
         if q.title_norm:
-            scored = [(TextCleaner.title_similarity(q.title_norm, TextCleaner.normalize(r.track_name or "")), r) for r in rows]
+            scored = [
+                (TextCleaner.title_similarity(q.title_norm, TextCleaner.normalize(r.track_name or "")), r)
+                for r in rows
+            ]
             best_sim = max(s for s, _ in scored)
             rows = [r for s, r in scored if s >= best_sim - 0.05]
-            if len(rows) == 1:
-                return rows[0]
+            title_score = best_sim
+        else:
+            # Nessun titolo da confrontare: non possiamo validare testualmente
+            # l'ISRC, quindi non c'è un punteggio affidabile da opporre alla
+            # soglia. Trattato come non abbastanza sicuro per lo step DB-first.
+            title_score = 0.0
+
+        if title_score < self.min_score:
+            self.log.debug(
+                f"[LocalDbMatcher] ISRC hit sotto soglia titolo "
+                f"({title_score:.2f} < {self.min_score:.2f}), trattato come miss."
+            )
+            return None
+
+        if len(rows) == 1:
+            return rows[0], title_score
 
         await self._preload_albums(rows)
         await self._preload_track_counts(rows)
-        return max(rows, key=lambda r: self._edition_score(r, q))
+        best_row = max(rows, key=lambda r: self._edition_score(r, q))
+        return best_row, title_score
 
-    async def _candidate_rows(self, title_norm: str, artist_norm: str) -> list[AppleMusicTrack]:
+    async def _candidate_rows(self, title_norm: str, artist_norm: str, hint_norm: str = "") -> list[AppleMusicTrack]:
+        """
+        Costruisce le condizioni ILIKE per titolo/artista/album e le
+        combina con AND. Se l'AND risulta troppo restrittivo (0 righe),
+        allarga progressivamente a OR — stesso pattern di fallback già
+        usato quando c'erano solo titolo+artista, ora esteso al terzo
+        campo (album) quando disponibile.
+        """
         title_kw = self._keywords(title_norm)
         artist_kw = self._keywords(artist_norm)
-        if not title_kw and not artist_kw:
+        album_kw = self._keywords(hint_norm) if hint_norm else []
+        if not title_kw and not artist_kw and not album_kw:
             return []
 
         conds = []
@@ -157,12 +210,25 @@ class LocalDbMatcher:
             conds.append(or_(*(AppleMusicTrack.track_name.ilike(f"%{w}%") for w in title_kw)))
         if artist_kw:
             conds.append(or_(*(AppleMusicTrack.artist_name.ilike(f"%{w}%") for w in artist_kw)))
+        if album_kw:
+            conds.append(or_(*(AppleMusicTrack.collection_name.ilike(f"%{w}%") for w in album_kw)))
 
         where = and_(*conds) if len(conds) > 1 else conds[0]
         stmt = select(AppleMusicTrack).where(where).limit(self.MAX_CANDIDATES)
         rows = list((await self.session.execute(stmt)).scalars().all())
 
-        if not rows and len(conds) > 1:  # AND troppo restrittivo: allarga a OR
+        if not rows and len(conds) > 1:
+            # AND(title, artist, album) troppo restrittivo: prova a
+            # rilassare togliendo l'album prima di cadere a OR totale,
+            # così un album-hint leggermente diverso (es. edizione
+            # deluxe non presente nel DB) non fa perdere un match valido
+            # su titolo+artista.
+            if album_kw and len(conds) == 3:
+                relaxed = and_(conds[0], conds[1])
+                stmt = select(AppleMusicTrack).where(relaxed).limit(self.MAX_CANDIDATES)
+                rows = list((await self.session.execute(stmt)).scalars().all())
+
+        if not rows and len(conds) > 1:  # ancora vuoto: allarga a OR pieno
             stmt = select(AppleMusicTrack).where(or_(*conds)).limit(self.MAX_CANDIDATES)
             rows = list((await self.session.execute(stmt)).scalars().all())
         return rows

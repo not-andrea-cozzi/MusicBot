@@ -14,7 +14,10 @@ from Algorithm.TextCleaner import TextCleaner
 from Algorithm.RegexToken import FakeAlbumSuffix
 from Utils.MusicPatterns import MusicPatterns
 
-_PRESERVE_SUFFIX_RE = re.compile(r'\((instrumental|interlude)\)', re.IGNORECASE)
+_PRESERVE_SUFFIX_RE = re.compile(
+    r'\((instrumental|interlude|acoustic|live|remaster(?:ed)?|extended)\)',
+    re.IGNORECASE,
+)
 _GENERIC_CHANNEL_RE = re.compile(
     r'(vevo|topic|official|channel|music|lyrics|audio|video|mix|playlist|sounds?|records?|entertainment)$',
     re.IGNORECASE,

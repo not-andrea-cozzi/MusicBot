@@ -40,6 +40,7 @@ _DEFAULT_WEIGHTS: dict[str, float] = {
     "track_id":         10.0,
     "live_mismatch":     3.0,
     "remix_mismatch":    3.0,
+    "acoustic_mismatch": 3.0,
     "compilation_penalty": 2.0,
 }
 
@@ -54,6 +55,12 @@ _REMIX_RE = re.compile(
 )
 
 _LIVE_RE = re.compile(r"\blive\b", re.IGNORECASE)
+
+# Stesso trattamento di _LIVE_RE/_REMIX_RE: senza questo, un candidato
+# studio e uno acustico ottengono la stessa distanza (title_dist quasi
+# identico, nessun altro segnale li separa) e il matcher non ha modo di
+# preferire l'edizione corretta quando il titolo sorgente la richiede.
+_ACOUSTIC_RE = re.compile(r"\bacoustic\b", re.IGNORECASE)
 
 _SINGLE_EP_SUFFIX_RE = re.compile(r"\s*-\s*(single|ep)\s*$", re.IGNORECASE)
 
@@ -283,6 +290,10 @@ def _has_remix(text: str) -> bool:
     return bool(_REMIX_RE.search(text))
 
 
+def _has_acoustic(text: str) -> bool:
+    return bool(_ACOUSTIC_RE.search(text))
+
+
 def _is_eponymous_single(title: str, cand_album: str) -> bool:
     if not _is_single_or_ep_name(cand_album):
         return False
@@ -366,6 +377,11 @@ class TrackMatcher:
         cand_remix = _has_remix(cand_title) or _has_remix(cand_album)
         if src_remix != cand_remix:
             dist.add("remix_mismatch", 1.0)
+
+        src_acoustic  = _has_acoustic(title)  or _has_acoustic(album_hint)
+        cand_acoustic = _has_acoustic(cand_title) or _has_acoustic(cand_album)
+        if src_acoustic != cand_acoustic:
+            dist.add("acoustic_mismatch", 1.0)
 
         if artist and cand_artist.lower() not in _VA_ARTISTS:
             artist_dist = string_dist(artist, cand_artist)

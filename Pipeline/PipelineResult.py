@@ -35,7 +35,7 @@ class MBResult:
     album_is_deluxe: bool = False           # album trovato è edizione deluxe/expanded
     title_has_remix: bool = False           # titolo originale contiene "(Remix)" o simili
 
-    # NUOVO: identità di edizione (single/EP/album) della release scelta.
+    # identità di edizione (single/EP/album) della release scelta.
     # Usato per decidere se un match ISRC con un altro provider è "sicuro"
     # per fondere track_number/disc_number/album, o se le due release sono
     # semplicemente diverse pur condividendo il recording.
@@ -75,15 +75,13 @@ class ITunesResult:
     matched_by_isrc: bool = False
 
     # Usati per la validazione incrociata con MB
-    itunes_track_number: Optional[int] = None
-    itunes_disc_number: Optional[int] = None
     itunes_duration_ms: Optional[int] = None
     itunes_album: str = ""
 
-    # NUOVO: stessa semantica di MBResult.release_edition
+    # stessa semantica di MBResult.release_edition
     release_edition: Optional[ReleaseEdition] = None
 
-    # NUOVO: True se questo risultato proviene dalla cache locale (DB) e
+    # True se questo risultato proviene dalla cache locale (DB) e
     # quindi non deve generare scritture di persistenza a valle.
     from_db: bool = False
 
@@ -96,7 +94,6 @@ class ITunesResult:
         return (
             f"ITunesResult(confidence={self.confidence.name}, "
             f"by_isrc={self.matched_by_isrc}, "
-            f"track={self.itunes_track_number}, "
             f"edition={edition}, "
             f"from_db={self.from_db}, "
             f"album={self.itunes_album!r})"

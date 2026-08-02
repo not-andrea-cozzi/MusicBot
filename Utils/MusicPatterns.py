@@ -26,6 +26,14 @@ class MusicPatterns:
 
     DURATION_TOLERANCE_MS = 5_000
     MATCHER_MIN_SCORE     = 0.55
+
+    # Soglia dedicata per accettare un DB-hit locale come step 1 della
+    # pipeline (bypassa iTunes/MB/Deezer/Spotify se raggiunta). Più alta
+    # di MATCHER_MIN_SCORE: qui un match debole non ha alcun controllo a
+    # valle nello stesso step — se accettiamo un hit sbagliato, saltiamo
+    # a torto tutta la ricerca remota e scriviamo metadati errati.
+    DB_LOCAL_MIN_SCORE    = 0.70
+
     ITUNES_VALID_COUNTRIES = frozenset({
         "US","GB","CA","AU","NZ","IE","FR","DE","IT","ES","PT","NL",
         "BE","CH","AT","SE","NO","DK","FI","PL","RU","GR","TR","JP",
@@ -45,4 +53,4 @@ class MusicPatterns:
 
     @classmethod
     def is_alt_version(cls, text: str) -> bool:
-        return bool(text) and bool(cls.ALT_VERSION_RE.search(text))
+        return bool(text) and bool(cls.ALT_VERSION_RE.search(text)) 

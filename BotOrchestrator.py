@@ -25,8 +25,6 @@ from Pipeline.SongProcessor import SongProcessor
 from Database.session import init_db
 
 
-# Sostituisci l'intera classe ThreadSafePipelineWrapper in BotOrchestrator.py
-
 class ThreadSafePipelineWrapper:
     """Crea provider + DB session isolati per ogni asyncio.run() call (un loop per song)."""
 
@@ -34,8 +32,6 @@ class ThreadSafePipelineWrapper:
         self.config      = config
         self.logger      = logger
         self._db_url: str = "mysql+asyncmy://user:password@localhost:3306/songdb"
-
-
 
     async def run(self, song: Song) -> Song:
         db_engine, db_session = await self._make_db_session()
@@ -142,7 +138,6 @@ class BotOrchestrator:
         self.cover_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
         self._cover_shutdown_timeout = self.config.network.get("cover_shutdown_timeout", 60)
-      
 
     def _make_processor(self) -> SongProcessor:
         """Crea un SongProcessor con pipeline isolata — chiamare per ogni thread."""
@@ -247,20 +242,19 @@ class BotOrchestrator:
                 except Exception as exc:
                     self.logger.error(f"[SongProcessor] Errore nell'elaborazione di {song.video_id}: {exc}")
 
-   
-
     def _shutdown_cover_executor(self) -> None:
+        """
+        Attesa attiva con timeout esplicito per la chiusura del pool copertine.
+
+        NOTA: rimosso un blocco precedente che chiamava
+        concurrent.futures.wait([], timeout=0) — attendeva una lista VUOTA
+        di future con timeout 0, quindi un no-op puro (il commento originale
+        lo ammetteva esplicitamente come "placeholder"). L'attesa reale è
+        interamente gestita dal polling sottostante su cover_executor._threads.
+        """
         self.logger.info("Attendo la chiusura del ThreadPoolExecutor delle copertine...")
         self.cover_executor.shutdown(wait=False)
-        try:
-            # cancel_futures non disponibile <3.9; fallback già gestito da wait=False sopra
-            done, not_done = concurrent.futures.wait(
-                [], timeout=0  # placeholder: usato solo se servono future espliciti
-            )
-        except Exception:
-            pass
 
-        # Attesa attiva con timeout esplicito invece di wait=True bloccante senza limite
         import time
         deadline = time.monotonic() + self._cover_shutdown_timeout
         while time.monotonic() < deadline:

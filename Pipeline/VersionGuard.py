@@ -8,22 +8,13 @@ from Algorithm.TextCleaner import TextCleaner
 from Algorithm.BestMatch import strip_parenthetical
 from Pipeline.PipelineResult import MBResult, ITunesResult, MatchConfidence
 from Pipeline.ReleaseEdition import isrc_match_is_safe
+from Utils.MusicPatterns import MusicPatterns
 
 
-# Regex per identificare tag di versione nel titolo
 _REMIX_TAG_RE   = re.compile(r'\b(?:remix|re-?mix)\b', re.IGNORECASE)
-_VERSION_TAG_RE = re.compile(
-    r'[\(\[]\s*(?:remix|re-?mix|radio\s+edit|extended|vip|club\s+mix|'
-    r'dub\s+mix|original\s+mix|acoustic|live|demo|instrumental)\b',
-    re.IGNORECASE,
-)
-_DELUXE_TAG_RE  = re.compile(
-    r'\b(?:deluxe|expanded|super\s+deluxe|anniversary|remastered|'
-    r'special\s+edition|bonus\s+track)\b',
-    re.IGNORECASE,
-)
+_VERSION_TAG_RE = MusicPatterns.VERSION_TAG_RE
+_DELUXE_TAG_RE  = MusicPatterns.DELUXE_TAG_RE
 
-# Tolleranza durata per validazione incrociata (ms)
 _DURATION_TOLERANCE_MS = 5_000   # ±5 secondi
 
 
@@ -88,7 +79,7 @@ class VersionGuard:
                 )
                 return False
 
-        # --- Controllo 4 (NUOVO): ISRC identico ma edizione di release diversa.
+        # --- Controllo 4: ISRC identico ma edizione di release diversa.
         # Stesso ISRC non garantisce stessa release: un brano può essere
         # single su un provider e già incluso in un album sull'altro.
         # In questo caso i campi di release (track_number/disc_number/album)

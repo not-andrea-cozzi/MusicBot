@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 from Model.Song import Song
 from Algorithm.TextCleaner import TextCleaner
+from Utils.MusicPatterns import MusicPatterns
 
 
 class MusicBrainzHelper:
@@ -15,21 +16,14 @@ class MusicBrainzHelper:
     _VINYL_SIDE_MAP = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6}
     _VINYL_RE = re.compile(r'^([A-F])(\d+)$', re.IGNORECASE)
     _MB_FAKE_COUNTRY_CODES = {"XW", "XE", "XU", "XX"}
-    _VALID = frozenset({
-        "US","GB","CA","AU","NZ","IE","FR","DE","IT","ES","PT","NL",
-        "BE","CH","AT","SE","NO","DK","FI","PL","RU","GR","TR","JP",
-        "KR","CN","TW","HK","IN","SG","MY","ID","TH","PH","ZA","MX",
-        "BR","AR","CL","CO","AE","SA","IL",
-    })
+    # Fonte unica: prima era una copia locale identica a
+    # MusicPatterns.ITUNES_VALID_COUNTRIES, mantenuta manualmente in due
+    # posti in perfetta sincronia solo per caso.
+    _VALID = MusicPatterns.ITUNES_VALID_COUNTRIES
 
-    # Stesso pattern usato in MusicBrainzApi/SpotifyProvider: scarta versioni
-    # alternative (instrumental/karaoke/ecc.) quando il titolo originale non
-    # le richiede esplicitamente.
-    _ALT_VERSION_RE = re.compile(
-        r'\b(instrumental|karaoke|a\s*cappella|acapella|sped\s*up|nightcore|'
-        r'slowed(?:\s*(?:and|&)?\s*reverb(?:ed)?)?|8d\s*audio|tiktok\s*remix)\b',
-        re.IGNORECASE,
-    )
+    # Fonte unica: prima era una copia locale identica a
+    # MusicPatterns.ALT_VERSION_RE (stesso pattern, stesso scopo).
+    _ALT_VERSION_RE = MusicPatterns.ALT_VERSION_RE
 
     @classmethod
     def _is_alt_version(cls, text: str) -> bool:
