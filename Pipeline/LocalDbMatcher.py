@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from Algorithm.BestMatch import TrackMatcher, strip_parenthetical
 from Algorithm.RegexToken import FakeAlbumSuffix
 from Algorithm.TextCleaner import TextCleaner
-from Database.Model.ItunesModel import AppleMusicAlbum, AppleMusicTrack
+from Database.Model.ItunesModel import AppleMusicAlbum, AppleMusicArtist, AppleMusicTrack
 from Helpers.MetaMapper import MetaMapper
 from Pipeline.ReleaseEdition import ReleaseEdition, ReleaseKind
 from Utils.MusicPatterns import MusicPatterns
@@ -56,6 +56,11 @@ class LocalDbMatcher:
         # Popolata da _preload_track_counts, una sola query aggregata per
         # batch di candidati invece di N query separate.
         self._real_track_count_cache: Dict[int, int] = {}
+        # artist_id -> record AppleMusicArtists (o None se non presente in
+        # tabella). Popolata in batch da _preload_artists (single IN(...));
+        # to_meta() usa _get_artist() come fallback puntuale se il record
+        # non era nella batch (es. path ISRC a riga singola).
+        self._artist_cache: Dict[int, Optional[AppleMusicArtist]] = {}
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -93,6 +98,15 @@ class LocalDbMatcher:
             default_artist=track.artist_name or "", logger=self.log,
         )
         mapped["_from_db"] = True
+
+        artist = await self._get_artist(track.artist_id)
+        if artist and artist.artist_name:
+            # Nome artista canonico da AppleMusicArtists, MAI ripulito:
+            # priorità massima in scrittura tag (vedi SongMetaWriter).
+            # NON sostituisce "artist" (usato per album_artist/compilation/
+            # sort fields): è un campo separato, dedicato solo al tag finale.
+            mapped["raw_artist_name"] = artist.artist_name
+
         return mapped
 
     # ── Query building ───────────────────────────────────────────────
@@ -116,6 +130,7 @@ class LocalDbMatcher:
             return None
         await self._preload_albums(rows)
         await self._preload_track_counts(rows)
+        await self._preload_artists(rows)
 
         best_track, best_score = None, -1.0
         for row in rows:
@@ -188,6 +203,7 @@ class LocalDbMatcher:
 
         await self._preload_albums(rows)
         await self._preload_track_counts(rows)
+        await self._preload_artists(rows)
         best_row = max(rows, key=lambda r: self._edition_score(r, q))
         return best_row, title_score
 
@@ -277,6 +293,33 @@ class LocalDbMatcher:
         result = await self.session.execute(stmt)
         for collection_id, count in result.all():
             self._real_track_count_cache[collection_id] = count
+
+    async def _preload_artists(self, rows: Iterable[AppleMusicTrack]) -> None:
+        """
+        Batch-load di AppleMusicArtists per gli artist_id dei candidati,
+        stessa strategia IN(...) di _preload_albums/_preload_track_counts
+        (elimina N+1). I miss vengono cachati esplicitamente a None così
+        una to_meta() successiva su quello stesso artist_id non riparte
+        con una query singola inutile.
+        """
+        ids = {r.artist_id for r in rows if r.artist_id and r.artist_id not in self._artist_cache}
+        if not ids:
+            return
+        stmt = select(AppleMusicArtist).where(AppleMusicArtist.artist_id.in_(ids))
+        found = {a.artist_id: a for a in (await self.session.execute(stmt)).scalars().all()}
+        for aid in ids:
+            self._artist_cache[aid] = found.get(aid)
+
+    async def _get_artist(self, artist_id: Optional[int]) -> Optional[AppleMusicArtist]:
+        """Fallback puntuale per to_meta() quando l'artist_id non è stato pre-caricato in batch (es. hit ISRC a riga singola)."""
+        if not artist_id:
+            return None
+        if artist_id in self._artist_cache:
+            return self._artist_cache[artist_id]
+        stmt = select(AppleMusicArtist).where(AppleMusicArtist.artist_id == artist_id)
+        artist = (await self.session.execute(stmt)).scalar_one_or_none()
+        self._artist_cache[artist_id] = artist
+        return artist
 
     @staticmethod
     def _expects_short_form(hint_norm: str, title_norm: str) -> bool:

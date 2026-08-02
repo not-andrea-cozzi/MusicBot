@@ -26,6 +26,12 @@ class MetaMapper:
 
         track_number = int(item["trackNumber"]) if item.get("trackNumber") else 0
         disc_number  = int(item["discNumber"])  if item.get("discNumber")  else 0
+        # trackCount/discCount: sull'item "track" di iTunes rappresentano il
+        # totale tracce/dischi della COLLECTION (non il progressivo), stesso
+        # campo sia da lookup album che da search "song" che dal DB locale
+        # (_track_to_dict espone "trackCount"/"discCount" da AppleMusicTrack).
+        total_tracks = int(item["trackCount"]) if item.get("trackCount") else 0
+        total_discs  = int(item["discCount"])  if item.get("discCount")  else 0
 
         explicit_raw = item.get("trackExplicitness", "")
         is_explicit  = explicit_raw.lower()  in ("explicit", "cleaned")
@@ -61,6 +67,8 @@ class MetaMapper:
             "year":                 year,
             "track_number":         track_number,
             "disc_number":          disc_number,
+            "total_tracks":         total_tracks,
+            "total_discs":          total_discs,
             "cover_url":            cover_url,
             "genre":                item.get("primaryGenreName",    ""),
             "itunes_track_id":      str(item.get("trackId")        or ""),

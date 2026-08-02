@@ -9,7 +9,6 @@ import httpx
 from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
 from Model.SongMeta import SongMeta
-from Algorithm.TextCleaner import TextCleaner
 
 
 STOREFRONT_IDS = {
@@ -63,11 +62,14 @@ class SongMetaWriter:
             tags["\xa9nam"] = [m.title]
 
         if m.artist:
-            tags["\xa9ART"] = [m.artist_collection or m.artist]
+            # Priorità: nome artista canonico dal DB locale (AppleMusicArtists,
+            # MAI ripulito) > artist_collection (contributors aggregati) > artist.
+            tags["\xa9ART"] = [m.raw_artist_name or m.artist_collection or m.artist]
 
         
         if m.album_artist:
-            tags["aART"] = [TextCleaner.primary_artist(m.album_artist)]
+            # Scrittura tag: mai ripulire/trasformare artisti o titoli.
+            tags["aART"] = [m.album_artist]
 
         text_atoms = (
             ("\xa9alb", "album"),

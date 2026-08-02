@@ -18,6 +18,7 @@ class SongMeta:
     label:          str           = ""
     country:        str           = ""
     artist_collection:  str       = ""
+    raw_artist_name:    str       = ""  # nome artista canonico (AppleMusicArtists), MAI ripulito — priorità massima in scrittura tag
     composer:       str           = ""
     copyright:      str           = ""
 

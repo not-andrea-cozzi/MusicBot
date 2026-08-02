@@ -16,7 +16,7 @@ class AppleMusicAlbum(Base):
     wrapper_type:              Mapped[Optional[str]]  = mapped_column("WrapperType", String(50))
     collection_type:           Mapped[Optional[str]]  = mapped_column("CollectionType", String(50))
     artist_id:                 Mapped[Optional[int]]  = mapped_column("ArtistId", BigInteger)
-    artist_name:               Mapped[Optional[str]]  = mapped_column("ArtistName", String(255))
+    artist_name:                Mapped[Optional[str]]  = mapped_column("ArtistName", String(255))
     collection_name:           Mapped[Optional[str]]  = mapped_column("CollectionName", String(255))
     collection_view_url:       Mapped[Optional[str]]  = mapped_column("CollectionViewUrl", Text)
     collection_explicitness:   Mapped[Optional[str]]  = mapped_column("CollectionExplicitness", String(20))
@@ -69,3 +69,20 @@ class AppleMusicTrack(Base):
             self._artwork_url = re.sub(r"/\d+x\d+bb\.jpg$", "/1000x1000bb.jpg", value)
         else:
             self._artwork_url = value
+
+
+class AppleMusicArtist(Base):
+    """
+    Anagrafica artisti Apple Music. Collegata a AppleMusicTrack/AppleMusicAlbum
+    tramite ArtistId (nessuna FK esplicita: stesso campo già presente lì,
+    popolata da un processo esterno — vedi migration in Schema/db.sql).
+    """
+    __tablename__ = 'AppleMusicArtists'
+
+    artist_id:           Mapped[int]           = mapped_column("ArtistId", BigInteger, primary_key=True)
+    artist_name:         Mapped[Optional[str]] = mapped_column("ArtistName", String(255))
+    artist_type:         Mapped[Optional[str]] = mapped_column("ArtistType", String(50))
+    artist_link_url:     Mapped[Optional[str]] = mapped_column("ArtistLinkUrl", Text)
+    amg_artist_id:       Mapped[Optional[int]] = mapped_column("AmgArtistId", BigInteger)
+    primary_genre_name:  Mapped[Optional[str]] = mapped_column("PrimaryGenreName", String(100))
+    primary_genre_id:    Mapped[Optional[int]] = mapped_column("PrimaryGenreId", Integer)
