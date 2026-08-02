@@ -30,6 +30,7 @@ class Downloader:
 
     def download_url(self, url: str) -> list["Song"]:
         real_paths: dict[str, str] = {}
+        is_ytmusic_source = "music.youtube.com" in url.lower()
 
         def _pp_hook(info: dict) -> None:
             if info.get("status") == "finished":
@@ -55,7 +56,7 @@ class Downloader:
                 for e in info.get("entries") or [info]:
                     if not e:
                         continue
-                    
+
                     vid = e.get("id", "")
                     real = ""
 
@@ -71,10 +72,12 @@ class Downloader:
 
                     raw_title = e.get("title", "")
                     raw_artist = e.get("artist") or ""
-                    
-                  
+
                     if not raw_artist and " - " not in raw_title:
                         raw_artist = e.get("uploader") or ""
+
+                    entry_url = e.get("webpage_url") or e.get("original_url") or ""
+                    is_ytmusic = is_ytmusic_source or "music.youtube.com" in entry_url.lower()
 
                     song = Song(video_id=vid)
                     song.path_original = real
@@ -91,6 +94,7 @@ class Downloader:
                         "video_id":       vid,
                         "playlist_id":    e.get("playlist_id") or info.get("id") or "",
                         "playlist_title": e.get("playlist_title") or info.get("title") or "",
+                        "is_ytmusic":     is_ytmusic,
                     }
                     songs.append(song)
                     self.logger.debug(f"[Downloader] Trovato/Scaricato: {vid} -> {real}")

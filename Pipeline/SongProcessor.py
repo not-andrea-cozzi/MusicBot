@@ -72,25 +72,33 @@ class SongProcessor:
         info       = song.raw
         raw_title  = info.get("title", "") or ""
         raw_artist = info.get("artist") or info.get("uploader", "") or ""
+        is_ytmusic = bool(info.get("is_ytmusic"))
 
-        if " - " in raw_title and not raw_artist:
-            raw_artist, raw_title = raw_title.split(" - ", 1)
+        if is_ytmusic:
+            raw_title = raw_title.strip()
+            raw_artist = raw_artist.strip()
+            clean_title = raw_title
+            preserved = ""
+            self.logger.debug(f"[Seed] Sorgente YT Music, uso as-is: '{raw_title}' - '{raw_artist}'")
         else:
-            raw_artist, raw_title = TextCleaner.extract_artist_from_title(raw_title, raw_artist)
+            if " - " in raw_title and not raw_artist:
+                raw_artist, raw_title = raw_title.split(" - ", 1)
+            else:
+                raw_artist, raw_title = TextCleaner.extract_artist_from_title(raw_title, raw_artist)
 
-        raw_title, raw_artist = TextCleaner.enrich_artist_from_title(raw_title, raw_artist)
+            raw_title, raw_artist = TextCleaner.enrich_artist_from_title(raw_title, raw_artist)
 
-        if raw_artist and _GENERIC_CHANNEL_RE.search(raw_artist):
-            self.logger.debug(f"[Seed] Canale generico ignorato: {raw_artist!r}")
-            raw_artist = ""
+            if raw_artist and _GENERIC_CHANNEL_RE.search(raw_artist):
+                self.logger.debug(f"[Seed] Canale generico ignorato: {raw_artist!r}")
+                raw_artist = ""
 
-        preserved = ""
-        if m := _PRESERVE_SUFFIX_RE.search(raw_title):
-            preserved = f" ({m.group(1).capitalize()})"
+            preserved = ""
+            if m := _PRESERVE_SUFFIX_RE.search(raw_title):
+                preserved = f" ({m.group(1).capitalize()})"
 
-        clean_title = TextCleaner.clean_title(raw_title, raw_artist)
-        if preserved and preserved.lower() not in clean_title.lower():
-            clean_title += preserved
+            clean_title = TextCleaner.clean_title(raw_title, raw_artist)
+            if preserved and preserved.lower() not in clean_title.lower():
+                clean_title += preserved
 
         year_raw      = str(info.get("release_year") or (info.get("upload_date") or "")[:4] or "")
         track_num_raw = info.get("track_number")
